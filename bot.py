@@ -115,35 +115,118 @@ class MexcWebClient:
                                 data=body_json, headers={**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": sign}).json()
 
 # ==========================================
-# 🤖 ОБРОБНИК СИГНАЛІВ
+# 🤖 ОБРОБНИК СИГНАЛІВ (REVERSAL STRATEGY)
 # ==========================================
-mexc = MexcWebClient(os.getenv("MEXC_TOKEN", ""))
-active_positions = {}
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_chat.id) != str(os.getenv("SIGNAL_CHANNEL_ID", "")): return
-    msg = update.channel_post.text or update.channel_post.caption
-    match = re.search(r'(\{.*\})', msg or "", re.DOTALL)
-    if not match: return
+    target_id = str(os.getenv("SIGNAL_CHANNEL_ID", "")).strip()
+    current_id = str(update.effective_chat.id).strip()
+    
+    # Перевірка, чи повідомлення з нашого каналу
+    if current_id != target_id:
+        return
+
+    msg_text = update.channel_post.text or update.channel_post.caption or ""
+    
+    # Витягуємо JSON з тексту алерту
+    json_match = re.search(r'(\{.*\})', msg_text, re.DOTALL)
+    if not json_match:
+        return
         
     try:
-        data = json.loads(match.group(1))
-        symbol, direction, price = data['symbol'], data['direction'], float(data['stats']['lastPrice'])
+        data = json.loads(json_match.group(1))
+        symbol = str(data['symbol']).upper()
+        signal_type = str(data.get('signalType', '')).upper()
+        price = float(data['stats']['lastPrice'])
         
-        if symbol not in os.getenv("ALLOWED_SYMBOLS", "").split(",") or symbol in active_positions: return
+        # 🟢 ЛОГІКА ВІДСКОКУ (Mean Reversion)
+        my_direction = None
+        
+        if signal_type == "LONG_FLUSH":
+            # Ринок падає -> купуємо відскок вгору
+            my_direction = "LONG"
+        elif signal_type == "SHORT_SQUEEZE":
+            # Ринок злітає -> продаємо відкат вниз
+            my_direction = "SHORT"
+        
+        if not my_direction:
+            logging.info(f"⏭ Пропущено: тип сигналу {signal_type} не підтримується")
+            return
 
-        # Розрахунок
-        bal = mexc.get_wallet_balance()
-        risk_usd = bal * (float(os.getenv("RISK_PERCENTAGE", 2.5)) / 100)
-        qty = int((risk_usd / (float(os.getenv("STOP_LOSS_PERCENT", 0.3)) / 100)) / price)
+        logging.info(f"🎯 СТРАТЕГІЯ: {signal_type} знайдено. Готуємо позицію {my_direction} для {symbol}")
+
+        # 1. Перевірка дозволених монет
+        allowed_list = [s.strip().upper() for s in os.getenv("ALLOWED_SYMBOLS", "").split(",")]
+        if symbol not in allowed_list:
+            logging.info(f"🚫 Монета {symbol} відсутня в ALLOWED_SYMBOLS")
+            return
+
+        # 2. Перевірка, чи вже відкрита позиція по цій монеті
+        if symbol in active_positions:
+            logging.info(f"⏳ {symbol} вже в роботі, ігноруємо дублікат")
+            return
+
+        # 3. Розрахунок параметрів угоди
+        balance = mexc.get_wallet_balance()
+        risk_pct = float(os.getenv("RISK_PERCENTAGE", 2.5))
+        sl_pct = float(os.getenv("STOP_LOSS_PERCENT", 0.5)) / 100
+        leverage = int(os.getenv("LEVERAGE", 20))
+
+        # Сума ризику в USDT
+        risk_amount_usd = balance * (risk_pct / 100)
+        # Об'єм позиції (Qty) = Ризик / %Стоп-Лоссу / Ціна
+        quantity = int((risk_amount_usd / sl_pct) / price)
         
-        res = mexc.place_order(symbol, direction, qty or 1, int(os.getenv("LEVERAGE", 20)))
+        if quantity < 1: quantity = 1
+
+        # 4. Відправка ордеру на MEXC
+        res = mexc.place_order(symbol, my_direction, quantity, leverage)
         
         if res.get("success") or res.get("code") == 200 or res.get("dry_run"):
             active_positions[symbol] = True
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"✅ ПОРТФЕЛЬ: {direction} {symbol}\nЦіна: {price}\nК-ть: {qty}")
+            
+            # Гарне сповіщення про вхід в угоду
+            status_text = "🧪 [TEST MODE]" if res.get("dry_run") else "💰 [REAL TRADE]"
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=(
+                    f"{status_text}\n"
+                    f"⚡️ **ВХІД НА ВІДСКОК**\n\n"
+                    f"Монета: #{symbol}\n"
+                    f"Тип: {signal_type}\n"
+                    f"Напрямок: {my_direction}\n"
+                    f"Ціна входу: {price}\n"
+                    f"Кількість: {quantity}\n"
+                    f"Плече: {leverage}x"
+                ),
+                parse_mode="Markdown"
+            )
+            logging.info(f"✅ Успішно відкрито {my_direction} по {symbol}")
+        else:
+            logging.error(f"❌ Помилка ордеру MEXC: {res}")
+
     except Exception as e:
-        logging.error(f"Помилка обробки: {e}")
+        logging.error(f"❌ Критична помилка обробника: {e}")
+
+# ==========================================
+# 🚀 ФУНКЦІЯ ПРИВІТАННЯ ПРИ ЗАПУСКУ
+# ==========================================
+
+async def post_init(application):
+    target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
+    if target_id:
+        try:
+            mode = "🧪 DRY RUN (Без реальних грошей)" if os.getenv("DRY_RUN") == "true" else "💰 REAL TRADING"
+            await application.bot.send_message(
+                chat_id=target_id, 
+                text=f"🤖 **MEXC Dolos Trader активований**\n\n"
+                     f"📡 Моніторинг каналу: ЗАПУЩЕНО\n"
+                     f"⚙️ Режим: {mode}\n"
+                     f"📈 Стратегія: Reversal (Flush/Squeeze)\n"
+                     f"🛡 Ризик: {os.getenv('RISK_PERCENTAGE')}% на угоду"
+            )
+        except Exception as e:
+            logging.error(f"Не вдалося відправити старт-повідомлення: {e}")
 
 # ==========================================
 # 🏁 ГОЛОВНИЙ ЗАПУСК (БЕЗ ASYNCIO.RUN)
