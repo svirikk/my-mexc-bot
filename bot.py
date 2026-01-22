@@ -237,16 +237,13 @@ def main():
         logging.error("❌ Токен не знайдено!")
         return
 
-    # Створюємо додаток через ApplicationBuilder
-    application = ApplicationBuilder().token(token).build()
+    # ДОДАЄМО post_init СЮДИ:
+    application = ApplicationBuilder().token(token).post_init(post_init).build()
     
     # Додаємо обробник
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
     logging.info("🤖 Бот запущено. Очікування сигналів...")
     
-    # Використовуємо run_polling (це блокуючий виклик, asyncio.run не потрібен)
+    # Використовуємо run_polling
     application.run_polling(drop_pending_updates=True)
-
-if __name__ == '__main__':
-    main()
