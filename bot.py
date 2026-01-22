@@ -244,26 +244,33 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 # 🏁 ЗАПУСК (MAIN)
 # ==========================================
 
-async def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        logging.error("❌ TELEGRAM_BOT_TOKEN не знайдено!")
+def main():
+    # Отримуємо змінні та очищаємо їх від пробілів/переносів
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    mexc_auth = os.getenv("MEXC_TOKEN", "").strip()
+    channel_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
+
+    if not token or not mexc_auth or not channel_id:
+        logging.error("❌ CRITICAL: Missing environment variables (Token, MEXC Auth, or Channel ID)!")
         return
 
+    # Створюємо додаток
+    # run_polling автоматично ініціалізує, запускає та зупиняє бота
     application = ApplicationBuilder().token(token).build()
+    
+    # Додаємо обробник повідомлень
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
-    logging.info("🤖 Бот запущено. Очікування сигналів...")
-    
-    async with application:
-        await application.initialize()
-        await application.start_polling()
-        # Тримаємо програму запущеною
-        while True:
-            await asyncio.sleep(3600)
+    logging.info("🤖 Бот запускається... Очікування сигналів.")
+
+    # Цей метод ідеальний для Railway: він тримає процес активним 
+    # і коректно завершує його при перезавантаженні сервера
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         logging.info("Бот зупинений.")
+    except Exception as e:
+        logging.error(f"Критична помилка при запуску: {e}")
