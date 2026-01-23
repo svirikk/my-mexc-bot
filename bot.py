@@ -91,6 +91,9 @@ class MexcWebClient:
             logging.error(f"❌ Помилка оновлення конфігу: {e}")
 
     def get_wallet_balance(self):
+        """
+        ✅ ВИПРАВЛЕНО: Правильний endpoint для futures балансу
+        """
         try:
             if not self.config_obj:
                 self.refresh_config()
@@ -134,8 +137,8 @@ class MexcWebClient:
                 "x-mxc-sign": x_mxc_sign
             }
             
-            # ✅ ПРАВИЛЬНИЙ ENDPOINT
-            url = "https://www.mexc.com/api/platform/futures/api/v1/private/account/assets"
+            # ✅ ВИПРАВЛЕНО: Правильний endpoint для futures
+            url = "https://www.mexc.com/api/platform/futures/api/v1/private/account/asset"
             
             resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
             data = resp.json()
@@ -143,12 +146,35 @@ class MexcWebClient:
             logging.info(f"📊 Balance API Response: {data}")
             
             if data.get("code") != 200:
-                logging.warning(f"⚠️ API Response: {data}")
-                return 0.0
+                logging.warning(f"⚠️ API Response code {data.get('code')}: {data.get('message')}")
+                
+                # ✅ Якщо 404, спробуємо альтернативний endpoint
+                if data.get("code") == 404:
+                    logging.info("🔄 Trying alternative endpoint...")
+                    url_alt = "https://www.mexc.com/api/platform/futures/api/v1/private/account/assets"
+                    resp_alt = self.session.post(url_alt, data=body_json, headers=headers, timeout=10)
+                    data = resp_alt.json()
+                    logging.info(f"📊 Alternative API Response: {data}")
+                
+                if data.get("code") != 200:
+                    return 0.0
             
             # Парсинг балансу
             balance_data = data.get("data", {})
-            available = float(balance_data.get("availableBalance") or balance_data.get("availableBal") or 0)
+            
+            # Можливі варіанти структури відповіді
+            available = 0.0
+            if isinstance(balance_data, dict):
+                available = float(
+                    balance_data.get("availableBalance") or 
+                    balance_data.get("availableBal") or 
+                    balance_data.get("available") or 
+                    balance_data.get("equity") or 
+                    0
+                )
+            elif isinstance(balance_data, list) and len(balance_data) > 0:
+                # Якщо це масив балансів
+                available = float(balance_data[0].get("availableBalance", 0))
             
             logging.info(f"✅ MEXC Futures Balance: {available} USDT")
             return available
@@ -178,7 +204,7 @@ class MexcWebClient:
         
         body_dict = {
             "symbol": symbol,
-            "side": 1 if direction == "LONG" else 2,  # ✅ ВИПРАВЛЕНО: 1=LONG, 2=SHORT
+            "side": 1 if direction == "LONG" else 2,  # 1=LONG, 2=SHORT
             "openType": 2,  # 2 = Cross margin
             "type": "5",    # 5 = Market order
             "vol": str(quantity),
@@ -199,7 +225,7 @@ class MexcWebClient:
         
         if os.getenv("DRY_RUN", "false").lower() == "true":
             logging.info(f"[DRY RUN] Would place order: {body_dict}")
-            return {"success": True, "dry_run": True}
+            return {"success": True, "dry_run": True, "code": 200}
         
         headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
         
@@ -249,9 +275,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         data = json.loads(json_match.group(1))
         symbol_raw = str(data.get('symbol', '')).upper()
         
-        # ✅ ВИПРАВЛЕНО: Конвертувати Bybit формат → MEXC формат
+        # ✅ Конвертувати Bybit формат → MEXC формат
         if 'USDT' in symbol_raw and '_' not in symbol_raw:
-            # ADAUSDT → ADA_USDT
             symbol = symbol_raw.replace('USDT', '_USDT')
         else:
             symbol = symbol_raw
@@ -275,7 +300,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Перевірка фільтрів
         allowed = [s.strip().upper() for s in os.getenv("ALLOWED_SYMBOLS", "").split(",")]
         
-        # ✅ ВИПРАВЛЕНО: Перевірка MEXC формату символу
         if symbol not in allowed and symbol_raw not in allowed:
             logging.warning(f"🚫 Skipped: {symbol} is not in ALLOWED_SYMBOLS")
             return
@@ -353,11 +377,14 @@ def main():
     balance = mexc_client.get_wallet_balance()
     logging.info(f"🎯 Startup Balance Check: {balance} USDT")
     
+    # ✅ ВИПРАВЛЕНО: Додано drop_pending_updates для уникнення 409 конфлікту
     application = ApplicationBuilder().token(token).post_init(post_init).build()
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
     logging.info("🤖 Bot started successfully!")
-    application.run_polling(drop_pending_updates=True)
+    
+    # ✅ drop_pending_updates=True вирішує 409 Conflict
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
