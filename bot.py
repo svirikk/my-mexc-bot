@@ -178,6 +178,67 @@ class MexcWebClient:
             logging.error(f"❌ Balance Error: {e}", exc_info=True)
             return 0.0
 
+    def get_open_positions(self):
+        """
+        ✅ НОВИЙ МЕТОД: Отримання списку відкритих позицій
+        """
+        try:
+            if not self.config_obj:
+                self.refresh_config()
+            
+            ts = str(int(time.time() * 1000))
+            mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
+            
+            p0, k0 = self.crypto.encrypt_request({
+                "hostname": "contract.mexc.com",
+                "mhash": mhash,
+                "mtoken": self.crypto.mtoken,
+                "platform_type": 3,
+                "product_type": 0,
+                "request_id": "",
+                "sys": "Linux",
+                "sys_ver": "",
+                "member_id": ""
+            })
+            
+            body_dict = {
+                "p0": p0,
+                "k0": k0,
+                "chash": self.config_obj["chash"],
+                "mtoken": self.crypto.mtoken,
+                "ts": ts,
+                "mhash": mhash
+            }
+            
+            body_json = json.dumps(body_dict, separators=(",", ":"))
+            inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
+            x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
+            
+            headers = {
+                **self.base_headers,
+                "x-mxc-nonce": ts,
+                "x-mxc-sign": x_mxc_sign
+            }
+            
+            # Endpoint для отримання відкритих позицій
+            url = "https://contract.mexc.com/api/v1/private/position/open_positions"
+            
+            resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
+            data = resp.json()
+            
+            if not data.get("success"):
+                logging.warning(f"⚠️ Positions API: {data}")
+                return []
+            
+            positions = data.get("data", [])
+            logging.info(f"📊 Open Positions: {len(positions)} active")
+            
+            return positions
+            
+        except Exception as e:
+            logging.error(f"❌ Get Positions Error: {e}", exc_info=True)
+            return []
+
     def place_order(self, symbol, direction, quantity, leverage):
         if not self.config_obj: 
             self.refresh_config()
@@ -247,6 +308,47 @@ class MexcWebClient:
 # ==========================================
 active_positions = {}
 mexc_client = None
+position_check_interval = 30  # Перевірка кожні 30 секунд
+
+async def check_positions_loop(context: ContextTypes.DEFAULT_TYPE):
+    """
+    ✅ НОВИЙ: Фоновий моніторинг позицій
+    """
+    global mexc_client, active_positions
+    
+    if not mexc_client:
+        return
+    
+    try:
+        open_positions = mexc_client.get_open_positions()
+        open_symbols = set()
+        
+        # Збираємо символи відкритих позицій
+        for pos in open_positions:
+            symbol = pos.get("symbol", "")
+            if symbol:
+                open_symbols.add(symbol)
+        
+        # Перевіряємо, які позиції закрилися
+        closed_symbols = []
+        for symbol in list(active_positions.keys()):
+            if symbol not in open_symbols:
+                closed_symbols.append(symbol)
+                del active_positions[symbol]
+                logging.info(f"✅ Position CLOSED: {symbol}")
+        
+        # Відправляємо сповіщення про закриті позиції
+        if closed_symbols:
+            target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
+            if target_id:
+                for symbol in closed_symbols:
+                    await context.bot.send_message(
+                        chat_id=target_id,
+                        text=f"🔔 Позиція закрита: {symbol}\n\n✅ Бот готовий до нових сигналів на цей символ"
+                    )
+    
+    except Exception as e:
+        logging.error(f"❌ Position check error: {e}", exc_info=True)
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global mexc_client
@@ -343,20 +445,36 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         logging.error(f"❌ CRITICAL ERROR in handler: {e}", exc_info=True)
 
 async def post_init(application):
+    """
+    ✅ ОНОВЛЕНО: Запуск фонового моніторингу позицій
+    """
     target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
+    
+    # Запускаємо періодичну перевірку позицій
+    job_queue = application.job_queue
+    job_queue.run_repeating(
+        check_positions_loop, 
+        interval=position_check_interval, 
+        first=10  # Перша перевірка через 10 секунд
+    )
+    logging.info(f"⏰ Position monitoring started (check every {position_check_interval}s)")
+    
     if target_id:
         try:
             await application.bot.send_message(
                 chat_id=target_id, 
-                text=f"🚀 MEXC Copy Bot Started\n\n✅ Mode: {'DRY RUN' if os.getenv('DRY_RUN', 'false').lower() == 'true' else 'LIVE TRADING'}\n📊 Leverage: {os.getenv('LEVERAGE', 20)}x\n💰 Risk: {os.getenv('RISK_PERCENTAGE', 2.5)}%"
+                text=f"🚀 MEXC Copy Bot Started\n\n✅ Mode: {'DRY RUN' if os.getenv('DRY_RUN', 'false').lower() == 'true' else 'LIVE TRADING'}\n📊 Leverage: {os.getenv('LEVERAGE', 20)}x\n💰 Risk: {os.getenv('RISK_PERCENTAGE', 2.5)}%\n⏰ Position Check: {position_check_interval}s"
             )
         except Exception as e:
             logging.error(f"Post-init error: {e}")
 
 def main():
-    global mexc_client
+    global mexc_client, position_check_interval
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     mexc_token = os.getenv("MEXC_TOKEN", "").strip()
+    
+    # ✅ НОВИЙ: Налаштування інтервалу перевірки позицій
+    position_check_interval = int(os.getenv("POSITION_CHECK_INTERVAL", 30))
     
     if not token: 
         logging.error("❌ TELEGRAM_BOT_TOKEN not set!")
@@ -371,6 +489,14 @@ def main():
     # Тест балансу при старті
     balance = mexc_client.get_wallet_balance()
     logging.info(f"🎯 Startup Balance Check: {balance} USDT")
+    
+    # Перевірка відкритих позицій при старті
+    open_positions = mexc_client.get_open_positions()
+    for pos in open_positions:
+        symbol = pos.get("symbol", "")
+        if symbol:
+            active_positions[symbol] = True
+            logging.info(f"📌 Found existing position: {symbol}")
     
     # ✅ ВИПРАВЛЕНО: Додано drop_pending_updates для уникнення 409 конфлікту
     application = ApplicationBuilder().token(token).post_init(post_init).build()
