@@ -92,35 +92,32 @@ class MexcWebClient:
 
     def get_wallet_balance(self):
         try:
-            # Оновлений шлях до ф'ючерсного балансу
             ts = int(time.time() * 1000)
+            # ✅ ВИПРАВЛЕНИЙ ШЛЯХ (Ф'ЮЧЕРСНИЙ ГАМАНЕЦЬ)
             url = f"https://www.mexc.com/api/platform/futures/api/v1/private/account/asset/list?ts={ts}"
             
             resp = self.session.get(url, headers=self.base_headers, timeout=10)
             data = resp.json()
-            
-            if data.get("code") != 200:
-                logging.warning(f"⚠️ Не вдалося отримати ф'ючерсний баланс: {data}")
-                # Спробуємо альтернативний шлях для спотового балансу, якщо ф'ючерсний не відповів
-                url_spot = f"https://www.mexc.com/api/platform/asset/api/v1/private/asset/account/assets?currency=USDT&ts={ts}"
-                resp = self.session.get(url_spot, headers=self.base_headers, timeout=10)
-                data = resp.json()
 
-            # Парсинг даних (структура ф'ючерсного API MEXC)
-            if data.get("success") or data.get("code") == 200:
-                assets = data.get("data", [])
-                if isinstance(assets, list):
-                    for asset in assets:
-                        if asset.get("currency") == "USDT":
-                            return float(asset.get("available", 0))
-                elif isinstance(assets, dict): # Для спотового варіанту
-                    for asset in assets.get("balances", []):
-                        if asset.get("currency") == "USDT":
-                            return float(asset.get("available", 0))
+            # Якщо помилка доступу або токена
+            if data.get("code") != 200:
+                logging.warning(f"⚠️ API відповідь балансу: {data}")
+                return 0.0
+
+            # Парсинг ф'ючерсного балансу
+            # Структура відповіді MEXC Futures відрізняється від Spot
+            assets = data.get("data", [])
+            if isinstance(assets, list):
+                for asset in assets:
+                    if asset.get("currency") == "USDT":
+                        # availableBalance — це доступні кошти для торгівлі
+                        return float(asset.get("availableBalance", 0))
             
+            logging.info("ℹ️ USDT не знайдено на ф'ючерсному акаунті.")
             return 0.0
+
         except Exception as e: 
-            logging.error(f"❌ Помилка при запиті балансу: {e}")
+            logging.error(f"❌ Критична помилка балансу: {e}")
             return 0.0
 
     def place_order(self, symbol, direction, quantity, leverage):
