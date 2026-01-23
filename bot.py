@@ -92,54 +92,105 @@ class MexcWebClient:
 
     def get_wallet_balance(self):
         try:
-            ts = int(time.time() * 1000)
-            # ✅ ВИПРАВЛЕНИЙ ШЛЯХ (Ф'ЮЧЕРСНИЙ ГАМАНЕЦЬ)
-            url = f"https://www.mexc.com/api/platform/futures/api/v1/private/account/asset/list?ts={ts}"
+            if not self.config_obj:
+                self.refresh_config()
             
-            resp = self.session.get(url, headers=self.base_headers, timeout=10)
+            ts = str(int(time.time() * 1000))
+            mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
+            
+            # Генеруємо p0, k0 для шифрування
+            p0, k0 = self.crypto.encrypt_request({
+                "hostname": "www.mexc.com",
+                "mhash": mhash,
+                "mtoken": self.crypto.mtoken,
+                "platform_type": 3,
+                "product_type": 0,
+                "request_id": "",
+                "sys": "Linux",
+                "sys_ver": "",
+                "member_id": ""
+            })
+            
+            # Тіло запиту
+            body_dict = {
+                "p0": p0,
+                "k0": k0,
+                "chash": self.config_obj["chash"],
+                "mtoken": self.crypto.mtoken,
+                "ts": ts,
+                "mhash": mhash
+            }
+            
+            body_json = json.dumps(body_dict, separators=(",", ":"))
+            
+            # Підпис
+            inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
+            x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
+            
+            # Headers
+            headers = {
+                **self.base_headers,
+                "x-mxc-nonce": ts,
+                "x-mxc-sign": x_mxc_sign
+            }
+            
+            # ✅ ПРАВИЛЬНИЙ ENDPOINT
+            url = "https://www.mexc.com/api/platform/futures/api/v1/private/account/assets"
+            
+            resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
             data = resp.json()
-
-            # Якщо помилка доступу або токена
-            if data.get("code") != 200:
-                logging.warning(f"⚠️ API відповідь балансу: {data}")
-                return 0.0
-
-            # Парсинг ф'ючерсного балансу
-            # Структура відповіді MEXC Futures відрізняється від Spot
-            assets = data.get("data", [])
-            if isinstance(assets, list):
-                for asset in assets:
-                    if asset.get("currency") == "USDT":
-                        # availableBalance — це доступні кошти для торгівлі
-                        return float(asset.get("availableBalance", 0))
             
-            logging.info("ℹ️ USDT не знайдено на ф'ючерсному акаунті.")
-            return 0.0
-
-        except Exception as e: 
-            logging.error(f"❌ Критична помилка балансу: {e}")
+            logging.info(f"📊 Balance API Response: {data}")
+            
+            if data.get("code") != 200:
+                logging.warning(f"⚠️ API Response: {data}")
+                return 0.0
+            
+            # Парсинг балансу
+            balance_data = data.get("data", {})
+            available = float(balance_data.get("availableBalance") or balance_data.get("availableBal") or 0)
+            
+            logging.info(f"✅ MEXC Futures Balance: {available} USDT")
+            return available
+            
+        except Exception as e:
+            logging.error(f"❌ Balance Error: {e}", exc_info=True)
             return 0.0
 
     def place_order(self, symbol, direction, quantity, leverage):
-        if not self.config_obj: self.refresh_config()
+        if not self.config_obj: 
+            self.refresh_config()
+            
         ts = str(int(time.time() * 1000))
         mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
         
         p0, k0 = self.crypto.encrypt_request({
-            "hostname": "www.mexc.com", "mhash": mhash, "mtoken": self.crypto.mtoken, "platform_type": 3
+            "hostname": "www.mexc.com", 
+            "mhash": mhash, 
+            "mtoken": self.crypto.mtoken, 
+            "platform_type": 3,
+            "product_type": 0,
+            "request_id": "",
+            "sys": "Linux",
+            "sys_ver": "",
+            "member_id": ""
         })
         
         body_dict = {
             "symbol": symbol,
-            "side": 1 if direction == "LONG" else 3,
-            "openType": 1,
-            "type": "5",
-            "vol": int(quantity),
+            "side": 1 if direction == "LONG" else 2,  # ✅ ВИПРАВЛЕНО: 1=LONG, 2=SHORT
+            "openType": 2,  # 2 = Cross margin
+            "type": "5",    # 5 = Market order
+            "vol": str(quantity),
             "leverage": int(leverage),
             "marketCeiling": False,
             "priceProtect": "0",
-            "p0": p0, "k0": k0, "chash": self.config_obj["chash"],
-            "mtoken": self.crypto.mtoken, "ts": ts, "mhash": mhash
+            "p0": p0, 
+            "k0": k0, 
+            "chash": self.config_obj["chash"],
+            "mtoken": self.crypto.mtoken, 
+            "ts": ts, 
+            "mhash": mhash
         }
         
         body_json = json.dumps(body_dict, separators=(",", ":"))
@@ -147,15 +198,27 @@ class MexcWebClient:
         x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
         
         if os.getenv("DRY_RUN", "false").lower() == "true":
+            logging.info(f"[DRY RUN] Would place order: {body_dict}")
             return {"success": True, "dry_run": True}
         
         headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
         
         try:
-            r = self.session.post("https://www.mexc.com/api/platform/futures/api/v1/private/order/create", 
-                                data=body_json, headers=headers, timeout=10)
-            return r.json()
+            logging.info(f"📤 Placing REAL order: {direction} {symbol}, Qty: {quantity}, Leverage: {leverage}x")
+            
+            r = self.session.post(
+                "https://www.mexc.com/api/platform/futures/api/v1/private/order/create", 
+                data=body_json, 
+                headers=headers, 
+                timeout=10
+            )
+            
+            result = r.json()
+            logging.info(f"📥 MEXC Order Response: {result}")
+            
+            return result
         except Exception as e:
+            logging.error(f"❌ Order Exception: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
 # ==========================================
@@ -169,7 +232,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     target_id = str(os.getenv("SIGNAL_CHANNEL_ID", "")).strip()
     current_id = str(update.effective_chat.id).strip()
     
-    # 1. Логуємо факт отримання будь-якого посту
     logging.info(f"📩 POST received. Channel ID: {current_id}")
 
     if current_id != target_id:
@@ -185,16 +247,26 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     try:
         data = json.loads(json_match.group(1))
-        symbol = str(data.get('symbol', '')).upper()
+        symbol_raw = str(data.get('symbol', '')).upper()
+        
+        # ✅ ВИПРАВЛЕНО: Конвертувати Bybit формат → MEXC формат
+        if 'USDT' in symbol_raw and '_' not in symbol_raw:
+            # ADAUSDT → ADA_USDT
+            symbol = symbol_raw.replace('USDT', '_USDT')
+        else:
+            symbol = symbol_raw
+        
         signal_type = str(data.get('signalType', '')).upper()
         price = float(data['stats']['lastPrice'])
         
-        logging.info(f"🔎 Processing Signal: {symbol} | Type: {signal_type} | Price: {price}")
+        logging.info(f"🔎 Processing Signal: {symbol} (raw: {symbol_raw}) | Type: {signal_type} | Price: {price}")
         
         # Вибір напрямку
         my_direction = None
-        if signal_type == "LONG_FLUSH": my_direction = "LONG"
-        elif signal_type == "SHORT_SQUEEZE": my_direction = "SHORT"
+        if signal_type == "LONG_FLUSH": 
+            my_direction = "LONG"
+        elif signal_type == "SHORT_SQUEEZE": 
+            my_direction = "SHORT"
         
         if not my_direction: 
             logging.info(f"⏭ Skipped: Unknown Signal Type {signal_type}")
@@ -203,7 +275,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Перевірка фільтрів
         allowed = [s.strip().upper() for s in os.getenv("ALLOWED_SYMBOLS", "").split(",")]
         
-        if symbol not in allowed:
+        # ✅ ВИПРАВЛЕНО: Перевірка MEXC формату символу
+        if symbol not in allowed and symbol_raw not in allowed:
             logging.warning(f"🚫 Skipped: {symbol} is not in ALLOWED_SYMBOLS")
             return
             
@@ -216,31 +289,31 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         logging.info(f"💰 Current Balance: {balance} USDT")
         
         if balance < 5:
-            logging.error("❌ Balance too low or token expired (Balance = 0)")
+            logging.error(f"❌ Balance too low: {balance} USDT (minimum 5 USDT required)")
             return
 
         risk_usd = balance * (float(os.getenv("RISK_PERCENTAGE", 2.5)) / 100)
         sl_percent = float(os.getenv("STOP_LOSS_PERCENT", 0.5)) / 100
         qty = int((risk_usd / sl_percent) / price)
         
-        if qty < 1: qty = 1
+        if qty < 1: 
+            qty = 1
         
         logging.info(f"🚀 Placing Order: {my_direction} {symbol}, Qty: {qty}, Risk: ${risk_usd:.2f}")
 
         res = mexc_client.place_order(symbol, my_direction, qty, int(os.getenv("LEVERAGE", 20)))
         
-        # ЛОГІКА ОБРОБКИ РЕЗУЛЬТАТУ
+        # Обробка результату
         if res.get("success") or res.get("code") == 200 or res.get("dry_run"):
             active_positions[symbol] = True
             
             mode_text = "TEST MODE" if res.get("dry_run") else "REAL TRADE"
             await context.bot.send_message(
                 chat_id=target_id, 
-                text=f"✅ {mode_text}: {my_direction} {symbol}\n💰 Вхід: {price}\n📊 К-ть: {qty}"
+                text=f"✅ {mode_text}: {my_direction} {symbol}\n💰 Вхід: {price}\n📊 К-ть: {qty}\n💪 Плече: {os.getenv('LEVERAGE', 20)}x"
             )
             logging.info(f"✅ Order executed successfully: {res}")
         else:
-            # ОСЬ ЧОГО НЕ ВИСТАЧАЛО: Логування помилки
             logging.error(f"❌ ORDER FAILED. Exchange response: {res}")
             await context.bot.send_message(
                 chat_id=target_id, 
@@ -254,7 +327,10 @@ async def post_init(application):
     target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
     if target_id:
         try:
-            await application.bot.send_message(chat_id=target_id, text="🚀 Бот перезапущено. Debug Mode: ON")
+            await application.bot.send_message(
+                chat_id=target_id, 
+                text=f"🚀 MEXC Copy Bot Started\n\n✅ Mode: {'DRY RUN' if os.getenv('DRY_RUN', 'false').lower() == 'true' else 'LIVE TRADING'}\n📊 Leverage: {os.getenv('LEVERAGE', 20)}x\n💰 Risk: {os.getenv('RISK_PERCENTAGE', 2.5)}%"
+            )
         except Exception as e:
             logging.error(f"Post-init error: {e}")
 
@@ -263,14 +339,24 @@ def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     mexc_token = os.getenv("MEXC_TOKEN", "").strip()
     
-    if not token: return
+    if not token: 
+        logging.error("❌ TELEGRAM_BOT_TOKEN not set!")
+        return
+    
+    if not mexc_token:
+        logging.error("❌ MEXC_TOKEN not set!")
+        return
 
     mexc_client = MexcWebClient(mexc_token)
+    
+    # Тест балансу при старті
+    balance = mexc_client.get_wallet_balance()
+    logging.info(f"🎯 Startup Balance Check: {balance} USDT")
     
     application = ApplicationBuilder().token(token).post_init(post_init).build()
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
-    logging.info("🤖 System starting...")
+    logging.info("🤖 Bot started successfully!")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
