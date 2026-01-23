@@ -5,7 +5,6 @@ import base64
 import hashlib
 import re
 import logging
-from datetime import datetime
 from dotenv import load_dotenv
 
 # Cryptography
@@ -62,7 +61,7 @@ class MexcCrypto:
         return p0, k0
 
 # ==========================================
-# 🌐 КЛІЄНТ MEXC
+# 🌐 КЛІЄНТ MEXC (USDT-M Futures)
 # ==========================================
 class MexcWebClient:
     def __init__(self, token):
@@ -81,186 +80,98 @@ class MexcWebClient:
     def refresh_config(self):
         try:
             ts = int(time.time() * 1000)
+            # Конфіг беремо з основного сайту, це нормально
             url = "https://www.mexc.com/ucgateway/device_api/dolos/all_biz_config"
             payload = {"ts": ts, "platform_type": 3, "product_type": 0, "sdk_v": "0.0.17", "mtoken": ""}
             resp = self.session.post(url, json=payload, headers=self.base_headers, timeout=10)
             data = resp.json()
             decrypted = self.crypto.sigma_decrypt(data["data"])
             self.config_obj = decrypted[27] if len(decrypted) > 27 else decrypted[-1]
-            logging.info("✅ MEXC Конфігурація отримана.")
+            logging.info("✅ MEXC Config Refreshed")
         except Exception as e:
-            logging.error(f"❌ Помилка оновлення конфігу: {e}")
+            logging.error(f"❌ Config Refresh Error: {e}")
 
     def get_wallet_balance(self):
         """
-        Отримання балансу Futures
+        Отримання балансу через contract.mexc.com
         """
         try:
-            if not self.config_obj:
-                self.refresh_config()
+            if not self.config_obj: self.refresh_config()
             
             ts = str(int(time.time() * 1000))
             mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
             
+            # ВАЖЛИВО: hostname має бути contract.mexc.com
             p0, k0 = self.crypto.encrypt_request({
-                "hostname": "contract.mexc.com",
-                "mhash": mhash,
-                "mtoken": self.crypto.mtoken,
+                "hostname": "contract.mexc.com", 
+                "mhash": mhash, 
+                "mtoken": self.crypto.mtoken, 
                 "platform_type": 3,
-                "product_type": 0,
-                "request_id": "",
-                "sys": "Linux",
-                "sys_ver": "",
-                "member_id": ""
+                "product_type": 0
             })
             
             body_dict = {
-                "p0": p0,
-                "k0": k0,
-                "chash": self.config_obj["chash"],
-                "mtoken": self.crypto.mtoken,
-                "ts": ts,
-                "mhash": mhash
+                "p0": p0, "k0": k0, "chash": self.config_obj["chash"],
+                "mtoken": self.crypto.mtoken, "ts": ts, "mhash": mhash
             }
             
+            # Підпис
             body_json = json.dumps(body_dict, separators=(",", ":"))
             inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
             x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
             
-            headers = {
-                **self.base_headers,
-                "x-mxc-nonce": ts,
-                "x-mxc-sign": x_mxc_sign
-            }
+            headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
             
+            # URL для Futures
             url = "https://contract.mexc.com/api/v1/private/account/assets"
-            resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
-            data = resp.json()
             
-            logging.info(f"📊 Balance API Response: {data}")
-            
-            if not data.get("success") and data.get("code") != 200:
-                logging.warning(f"⚠️ API Response: {data}")
-                return 0.0
-            
-            balance_data = data.get("data", {})
-            available = 0.0
-            
-            if isinstance(balance_data, dict):
-                available = float(
-                    balance_data.get("availableBalance") or 
-                    balance_data.get("availableBal") or 
-                    balance_data.get("available") or 
-                    balance_data.get("equity") or 
-                    balance_data.get("totalBalance") or
-                    0
-                )
-            elif isinstance(balance_data, list) and len(balance_data) > 0:
-                for item in balance_data:
-                    if item.get("currency") == "USDT" or item.get("asset") == "USDT":
-                        available = float(item.get("availableBalance", 0))
-                        break
-            
-            logging.info(f"✅ MEXC Futures Balance: {available} USDT")
-            return available
-            
-        except Exception as e:
-            logging.error(f"❌ Balance Error: {e}", exc_info=True)
-            return 0.0
-
-    def get_open_positions(self):
-        """
-        Отримання відкритих позицій
-        """
-        try:
-            if not self.config_obj:
-                self.refresh_config()
-            
-            ts = str(int(time.time() * 1000))
-            mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
-            
-            p0, k0 = self.crypto.encrypt_request({
-                "hostname": "contract.mexc.com",
-                "mhash": mhash,
-                "mtoken": self.crypto.mtoken,
-                "platform_type": 3,
-                "product_type": 0,
-                "request_id": "",
-                "sys": "Linux",
-                "sys_ver": "",
-                "member_id": ""
-            })
-            
-            body_dict = {
-                "p0": p0,
-                "k0": k0,
-                "chash": self.config_obj["chash"],
-                "mtoken": self.crypto.mtoken,
-                "ts": ts,
-                "mhash": mhash
-            }
-            
-            body_json = json.dumps(body_dict, separators=(",", ":"))
-            inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
-            x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
-            
-            headers = {
-                **self.base_headers,
-                "x-mxc-nonce": ts,
-                "x-mxc-sign": x_mxc_sign
-            }
-            
-            url = "https://contract.mexc.com/api/v1/private/position/open_positions"
             resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
             data = resp.json()
             
             if not data.get("success"):
-                logging.warning(f"⚠️ Positions API: {data}")
-                return []
+                logging.warning(f"⚠️ Balance API Warning: {data}")
+                return 0.0
+
+            # Парсинг відповіді
+            balance_data = data.get("data", [])
+            if isinstance(balance_data, list):
+                for item in balance_data:
+                    if item.get("currency") == "USDT":
+                        return float(item.get("availableBalance", 0))
             
-            positions = data.get("data", [])
-            logging.info(f"📊 Open Positions: {len(positions)} active")
-            
-            return positions
-            
-        except Exception as e:
-            logging.error(f"❌ Get Positions Error: {e}", exc_info=True)
-            return []
+            return 0.0
+        except Exception as e: 
+            logging.error(f"❌ Balance Exception: {e}")
+            return 0.0
 
     def place_order(self, symbol, direction, quantity, leverage):
-        if not self.config_obj: 
-            self.refresh_config()
-            
+        if not self.config_obj: self.refresh_config()
         ts = str(int(time.time() * 1000))
         mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
         
+        # 1 = LONG, 3 = SHORT
+        side = 1 if direction == "LONG" else 3 
+        
+        # ВАЖЛИВО: hostname для підпису
         p0, k0 = self.crypto.encrypt_request({
-            "hostname": "www.mexc.com", 
+            "hostname": "contract.mexc.com", 
             "mhash": mhash, 
             "mtoken": self.crypto.mtoken, 
             "platform_type": 3,
-            "product_type": 0,
-            "request_id": "",
-            "sys": "Linux",
-            "sys_ver": "",
-            "member_id": ""
+            "product_type": 0
         })
         
         body_dict = {
             "symbol": symbol,
-            "side": 1 if direction == "LONG" else 2,
-            "openType": 2,
-            "type": "5",
-            "vol": str(quantity),
+            "side": side,
+            "openType": 1, # 1=Isolated, 2=Cross (можна змінити на 2, якщо потрібно Cross)
+            "type": "5",   # Market Order
+            "vol": int(quantity),
             "leverage": int(leverage),
             "marketCeiling": False,
             "priceProtect": "0",
-            "p0": p0, 
-            "k0": k0, 
-            "chash": self.config_obj["chash"],
-            "mtoken": self.crypto.mtoken, 
-            "ts": ts, 
-            "mhash": mhash
+            "p0": p0, "k0": k0, "chash": self.config_obj["chash"],
+            "mtoken": self.crypto.mtoken, "ts": ts, "mhash": mhash
         }
         
         body_json = json.dumps(body_dict, separators=(",", ":"))
@@ -268,413 +179,159 @@ class MexcWebClient:
         x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
         
         if os.getenv("DRY_RUN", "false").lower() == "true":
-            logging.info(f"[DRY RUN] Would place order: {body_dict}")
             return {"success": True, "dry_run": True, "code": 200}
         
         headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
         
         try:
-            logging.info(f"📤 Placing REAL order: {direction} {symbol}, Qty: {quantity}, Leverage: {leverage}x")
+            # URL для Futures Order
+            url = "https://contract.mexc.com/api/v1/private/order/create"
             
-            r = self.session.post(
-                "https://www.mexc.com/api/platform/futures/api/v1/private/order/create", 
-                data=body_json, 
-                headers=headers, 
-                timeout=10
-            )
-            
-            result = r.json()
-            logging.info(f"📥 MEXC Order Response: {result}")
-            
-            return result
+            r = self.session.post(url, data=body_json, headers=headers, timeout=10)
+            return r.json()
         except Exception as e:
-            logging.error(f"❌ Order Exception: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
-
-# ==========================================
-# 📊 POSITION TRACKER
-# ==========================================
-class PositionTracker:
-    def __init__(self):
-        self.open_positions = {}
-        self.closed_positions = []
-        
-    def add_position(self, symbol, direction, entry_price, quantity, leverage, stop_loss, take_profit, risk_amount):
-        self.open_positions[symbol] = {
-            "symbol": symbol,
-            "direction": direction,
-            "entry_price": entry_price,
-            "quantity": quantity,
-            "leverage": leverage,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "risk_amount": risk_amount,
-            "opened_at": datetime.now(),
-            "timestamp": int(time.time() * 1000)
-        }
-        logging.info(f"✅ Added to tracking: {symbol} {direction}")
-    
-    def remove_position(self, symbol):
-        if symbol in self.open_positions:
-            pos = self.open_positions.pop(symbol)
-            logging.info(f"🔔 Removed from tracking: {symbol}")
-            return pos
-        return None
-    
-    def has_position(self, symbol):
-        return symbol in self.open_positions
-    
-    def get_position(self, symbol):
-        return self.open_positions.get(symbol)
-    
-    def add_closed_position(self, position_data, exit_price, pnl, pnl_percent):
-        duration = datetime.now() - position_data["opened_at"]
-        
-        self.closed_positions.append({
-            **position_data,
-            "exit_price": exit_price,
-            "pnl": pnl,
-            "pnl_percent": pnl_percent,
-            "duration": str(duration).split('.')[0],
-            "closed_at": datetime.now()
-        })
-    
-    def get_statistics(self):
-        total_trades = len(self.closed_positions)
-        win_trades = sum(1 for p in self.closed_positions if p["pnl"] >= 0)
-        total_pnl = sum(p["pnl"] for p in self.closed_positions)
-        
-        return {
-            "total_trades": total_trades,
-            "win_trades": win_trades,
-            "lose_trades": total_trades - win_trades,
-            "total_pnl": total_pnl,
-            "open_positions": len(self.open_positions)
-        }
 
 # ==========================================
 # 💰 RISK MANAGEMENT
 # ==========================================
-def calculate_position_size(balance, entry_price, direction):
-    """
-    Розраховує розмір позиції
-    """
+def calculate_risk_params(balance, price, direction):
     try:
-        risk_percent = float(os.getenv("RISK_PERCENTAGE", 2.5))
-        sl_percent = float(os.getenv("STOP_LOSS_PERCENT", 0.5))
-        tp_percent = float(os.getenv("TAKE_PROFIT_PERCENT", 0.5))
-        leverage = int(os.getenv("LEVERAGE", 20))
+        risk_pct = float(os.getenv("RISK_PERCENTAGE", 2.5))
+        sl_pct = float(os.getenv("STOP_LOSS_PERCENT", 0.5))
+        tp_pct = float(os.getenv("TAKE_PROFIT_PERCENT", 0.5))
         
-        risk_usd = balance * (risk_percent / 100)
+        risk_amount = balance * (risk_pct / 100)
         
-        # Stop Loss
+        # Спрощений розрахунок: Ризик / %StopLoss
+        # Приклад: $10 ризику при 1% стопі = позиція на $1000
+        position_value_usd = risk_amount / (sl_pct / 100)
+        qty = int(position_value_usd / price)
+        
+        if qty < 1: qty = 1
+        
+        # Ціни
         if direction == "LONG":
-            sl_price = entry_price * (1 - sl_percent / 100)
-            tp_price = entry_price * (1 + tp_percent / 100)
+            sl_price = price * (1 - sl_pct / 100)
+            tp_price = price * (1 + tp_pct / 100)
         else:
-            sl_price = entry_price * (1 + sl_percent / 100)
-            tp_price = entry_price * (1 - tp_percent / 100)
-        
-        sl_distance = abs(entry_price - sl_price)
-        position_size_usd = (risk_usd / sl_distance) * entry_price
-        quantity = int(position_size_usd / entry_price)
-        
-        if quantity < 1:
-            quantity = 1
-        
+            sl_price = price * (1 + sl_pct / 100)
+            tp_price = price * (1 - tp_pct / 100)
+            
         return {
-            "quantity": quantity,
-            "stop_loss": round(sl_price, 4),
-            "take_profit": round(tp_price, 4),
-            "risk_amount": risk_usd,
-            "sl_percent": sl_percent,
-            "tp_percent": tp_percent
+            "qty": qty, "sl_price": sl_price, "tp_price": tp_price, "risk_amount": risk_amount,
+            "sl_pct": sl_pct, "tp_pct": tp_pct
         }
-        
     except Exception as e:
-        logging.error(f"❌ Risk calculation error: {e}")
+        logging.error(f"Risk Error: {e}")
         return None
 
 # ==========================================
 # 🤖 ЛОГІКА БОТА
 # ==========================================
+active_positions = {}
 mexc_client = None
-position_tracker = PositionTracker()
-position_check_interval = 30
-
-async def check_positions_loop(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Фоновий моніторинг позицій
-    """
-    global mexc_client, position_tracker
-    
-    if not mexc_client:
-        return
-    
-    try:
-        open_positions = mexc_client.get_open_positions()
-        open_symbols = set()
-        
-        for pos in open_positions:
-            symbol = pos.get("symbol", "")
-            if symbol:
-                open_symbols.add(symbol)
-        
-        closed_symbols = []
-        for symbol in list(position_tracker.open_positions.keys()):
-            if symbol not in open_symbols:
-                closed_symbols.append(symbol)
-                tracked_pos = position_tracker.remove_position(symbol)
-                
-                if tracked_pos:
-                    # Приблизний P&L
-                    entry_price = tracked_pos["entry_price"]
-                    direction = tracked_pos["direction"]
-                    exit_price = entry_price
-                    
-                    if direction == "LONG":
-                        pnl = (exit_price - entry_price) * tracked_pos["quantity"]
-                        pnl_percent = ((exit_price - entry_price) / entry_price) * 100
-                    else:
-                        pnl = (entry_price - exit_price) * tracked_pos["quantity"]
-                        pnl_percent = ((entry_price - exit_price) / entry_price) * 100
-                    
-                    position_tracker.add_closed_position(tracked_pos, exit_price, pnl, pnl_percent)
-                    
-                    # Сповіщення
-                    target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
-                    if target_id:
-                        emoji = "🟢" if pnl >= 0 else "🔴"
-                        result = "PROFIT" if pnl >= 0 else "LOSS"
-                        duration_str = str(datetime.now() - tracked_pos['opened_at']).split('.')[0]
-                        
-                        message = (
-                            f"{emoji} <b>POSITION CLOSED - {result}</b>\n\n"
-                            f"<b>Symbol:</b> {symbol}\n"
-                            f"<b>Direction:</b> {direction}\n"
-                            f"<b>Entry:</b> ${entry_price}\n"
-                            f"<b>Exit:</b> ${exit_price}\n"
-                            f"<b>Result:</b> {'+' if pnl >= 0 else ''}{pnl_percent:.2f}% "
-                            f"({'+' if pnl >= 0 else ''}${pnl:.2f})\n\n"
-                            f"<b>Duration:</b> {duration_str}\n\n"
-                            f"✅ Bot ready for new signals on {symbol}"
-                        )
-                        
-                        await context.bot.send_message(
-                            chat_id=target_id,
-                            text=message,
-                            parse_mode='HTML'
-                        )
-    
-    except Exception as e:
-        logging.error(f"❌ Position check error: {e}", exc_info=True)
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global mexc_client, position_tracker
-    
+    global mexc_client
     target_id = str(os.getenv("SIGNAL_CHANNEL_ID", "")).strip()
     current_id = str(update.effective_chat.id).strip()
     
-    logging.info(f"📩 POST received. Channel ID: {current_id}")
-
-    if current_id != target_id:
-        logging.info(f"⏭ Skipped: Wrong channel ID (Target: {target_id})")
-        return
+    if current_id != target_id: return
 
     msg_text = update.channel_post.text or update.channel_post.caption or ""
     json_match = re.search(r'(\{.*\})', msg_text, re.DOTALL)
     
-    if not json_match:
-        logging.info("ℹ️ Skipped: No JSON found in message")
-        return
+    if not json_match: return
         
     try:
         data = json.loads(json_match.group(1))
-        symbol_raw = str(data.get('symbol', '')).upper()
-        
-        if 'USDT' in symbol_raw and '_' not in symbol_raw:
-            symbol = symbol_raw.replace('USDT', '_USDT')
-        else:
-            symbol = symbol_raw
+        symbol_raw = str(data.get('symbol', '')).upper().replace('_', '').replace('USDT', '')
+        symbol_api = f"{symbol_raw}_USDT" # MEXC Futures API потребує формату XXX_USDT
         
         signal_type = str(data.get('signalType', '')).upper()
         price = float(data['stats']['lastPrice'])
         
-        logging.info(f"🔎 Processing Signal: {symbol} (raw: {symbol_raw}) | Type: {signal_type} | Price: {price}")
-        
         my_direction = None
-        if signal_type == "LONG_FLUSH": 
-            my_direction = "LONG"
-        elif signal_type == "SHORT_SQUEEZE": 
-            my_direction = "SHORT"
+        if signal_type == "LONG_FLUSH": my_direction = "LONG"
+        elif signal_type == "SHORT_SQUEEZE": my_direction = "SHORT"
         
-        if not my_direction: 
-            logging.info(f"⏭ Skipped: Unknown Signal Type {signal_type}")
+        if not my_direction: return
+
+        allowed_str = os.getenv("ALLOWED_SYMBOLS", "").upper()
+        if symbol_raw not in allowed_str and f"{symbol_raw}USDT" not in allowed_str:
             return
 
-        allowed = [s.strip().upper() for s in os.getenv("ALLOWED_SYMBOLS", "").split(",")]
-        
-        if symbol not in allowed and symbol_raw not in allowed:
-            logging.warning(f"🚫 Skipped: {symbol} is not in ALLOWED_SYMBOLS")
-            return
-            
-        if position_tracker.has_position(symbol):
-            logging.warning(f"⏳ Skipped: Position already active for {symbol}")
+        if symbol_raw in active_positions:
             return
 
         balance = mexc_client.get_wallet_balance()
-        logging.info(f"💰 Current Balance: {balance} USDT")
+        logging.info(f"💰 Available Futures Balance: {balance} USDT")
         
         if balance < 5:
-            logging.error(f"❌ Balance too low: {balance} USDT (minimum 5 USDT required)")
+            logging.error("❌ Balance too low for trade")
             return
 
-        # Розрахунок позиції
-        risk_params = calculate_position_size(balance, price, my_direction)
+        risk = calculate_risk_params(balance, price, my_direction)
+        if not risk: return
         
-        if not risk_params:
-            logging.error("❌ Risk calculation failed")
-            return
-        
-        qty = risk_params["quantity"]
-        stop_loss = risk_params["stop_loss"]
-        take_profit = risk_params["take_profit"]
-        risk_amount = risk_params["risk_amount"]
-        
-        logging.info(f"🚀 Placing Order: {my_direction} {symbol}, Qty: {qty}, Risk: ${risk_amount:.2f}")
+        logging.info(f"🚀 Opening {my_direction} {symbol_api}, Qty: {risk['qty']}")
 
-        res = mexc_client.place_order(symbol, my_direction, qty, int(os.getenv("LEVERAGE", 20)))
+        res = mexc_client.place_order(symbol_api, my_direction, risk['qty'], int(os.getenv("LEVERAGE", 20)))
         
         if res.get("success") or res.get("code") == 200 or res.get("dry_run"):
-            position_tracker.add_position(
-                symbol=symbol,
-                direction=my_direction,
-                entry_price=price,
-                quantity=qty,
-                leverage=int(os.getenv("LEVERAGE", 20)),
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                risk_amount=risk_amount
+            active_positions[symbol_raw] = True
+            
+            is_dry = res.get("dry_run")
+            header = "🧪 <b>DRY RUN</b>" if is_dry else "✅ <b>ORDER EXECUTED</b>"
+            emoji = "📈" if my_direction == "LONG" else "📉"
+            
+            msg = (
+                f"{header}\n"
+                f"<b>Symbol:</b> {symbol_api}\n"
+                f"<b>Side:</b> {emoji} {my_direction}\n"
+                f"<b>Price:</b> ${price}\n"
+                f"<b>Qty:</b> {risk['qty']}\n\n"
+                f"🎯 TP: ${risk['tp_price']:.4f}\n"
+                f"🛑 SL: ${risk['sl_price']:.4f}\n"
+                f"💸 Risk: ${risk['risk_amount']:.2f}"
             )
             
-            mode_text = "🧪 TEST MODE" if res.get("dry_run") else "✅ POSITION OPENED"
-            clean_symbol = symbol.replace('_USDT', '').replace('USDT', '')
-            dir_emoji = "📈" if my_direction == "LONG" else "📉"
-            balance_percent = (risk_amount / balance * 100)
-            
-            message = (
-                f"{mode_text}\n\n"
-                f"<b>Symbol:</b> {symbol}\n"
-                f"<b>Direction:</b> {dir_emoji} {my_direction}\n"
-                f"<b>Entry Price:</b> ${price}\n"
-                f"<b>Quantity:</b> {qty:,} {clean_symbol}\n"
-                f"<b>Leverage:</b> {int(os.getenv('LEVERAGE', 20))}x\n\n"
-                f"🎯 <b>Take Profit:</b> ${take_profit} (+{risk_params['tp_percent']:.2f}%)\n"
-                f"🛑 <b>Stop Loss:</b> ${stop_loss} (-{risk_params['sl_percent']:.2f}%)\n"
-                f"💰 <b>Risk:</b> ${risk_amount:.2f} ({balance_percent:.2f}% of balance)\n\n"
-                f"Signal from: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-            )
-            
-            await context.bot.send_message(
-                chat_id=target_id, 
-                text=message,
-                parse_mode='HTML'
-            )
-            logging.info(f"✅ Order executed successfully: {res}")
+            await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
         else:
-            logging.error(f"❌ ORDER FAILED. Exchange response: {res}")
-            await context.bot.send_message(
-                chat_id=target_id, 
-                text=f"❌ Помилка відкриття угоди {symbol}:\n{res.get('msg') or res.get('error') or res}"
-            )
+            logging.error(f"❌ Order Failed: {res}")
+            await context.bot.send_message(chat_id=target_id, text=f"❌ Error: {res.get('msg') or res}")
 
     except Exception as e:
-        logging.error(f"❌ CRITICAL ERROR in handler: {e}", exc_info=True)
+        logging.error(f"❌ Handler Error: {e}", exc_info=True)
 
 async def post_init(application):
-    global position_check_interval
-    
     target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
-    
-    job_queue = application.job_queue
-    job_queue.run_repeating(
-        check_positions_loop, 
-        interval=position_check_interval, 
-        first=10
-    )
-    logging.info(f"⏰ Position monitoring started (check every {position_check_interval}s)")
-    
     if target_id:
         try:
-            stats = position_tracker.get_statistics()
-            dry_run = "DRY RUN" if os.getenv('DRY_RUN', 'false').lower() == 'true' else "LIVE TRADING"
-            
-            message = (
-                f"🚀 <b>MEXC Copy Bot Started</b>\n\n"
-                f"✅ Mode: {dry_run}\n"
-                f"📊 Leverage: {os.getenv('LEVERAGE', 20)}x\n"
-                f"💰 Risk: {os.getenv('RISK_PERCENTAGE', 2.5)}%\n"
-                f"🛑 Stop Loss: {os.getenv('STOP_LOSS_PERCENT', 0.5)}%\n"
-                f"🎯 Take Profit: {os.getenv('TAKE_PROFIT_PERCENT', 0.5)}%\n"
-                f"⏰ Position Check: {position_check_interval}s\n\n"
-                f"📈 <b>Statistics:</b>\n"
-                f"Open Positions: {stats['open_positions']}\n"
-                f"Total Trades: {stats['total_trades']}\n"
-                f"Win Rate: {(stats['win_trades']/stats['total_trades']*100) if stats['total_trades'] > 0 else 0:.1f}%\n"
-                f"Total P&L: ${stats['total_pnl']:.2f}"
-            )
-            
-            await application.bot.send_message(
-                chat_id=target_id, 
-                text=message,
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            logging.error(f"Post-init error: {e}")
+            mode = "🧪 DRY RUN" if os.getenv("DRY_RUN") == "true" else "🔥 REAL TRADING"
+            await application.bot.send_message(chat_id=target_id, text=f"🚀 MEXC Bot (Contract API) Online\nMode: {mode}")
+        except: pass
 
 def main():
-    global mexc_client, position_check_interval
-    
+    global mexc_client
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     mexc_token = os.getenv("MEXC_TOKEN", "").strip()
-    position_check_interval = int(os.getenv("POSITION_CHECK_INTERVAL", 30))
     
-    if not token: 
-        logging.error("❌ TELEGRAM_BOT_TOKEN not set!")
-        return
-    
-    if not mexc_token:
-        logging.error("❌ MEXC_TOKEN not set!")
+    if not token or not mexc_token:
+        logging.error("❌ Tokens missing")
         return
 
     mexc_client = MexcWebClient(mexc_token)
     
-    balance = mexc_client.get_wallet_balance()
-    logging.info(f"🎯 Startup Balance Check: {balance} USDT")
-    
-    open_positions = mexc_client.get_open_positions()
-    for pos in open_positions:
-        symbol = pos.get("symbol", "")
-        if symbol:
-            position_tracker.open_positions[symbol] = {
-                "symbol": symbol,
-                "direction": "LONG" if pos.get("positionType") == 1 else "SHORT",
-                "entry_price": float(pos.get("openAvgPrice", 0)),
-                "quantity": float(pos.get("holdVol", 0)),
-                "leverage": float(pos.get("leverage", 20)),
-                "stop_loss": 0,
-                "take_profit": 0,
-                "risk_amount": 0,
-                "opened_at": datetime.now(),
-                "timestamp": int(time.time() * 1000)
-            }
-            logging.info(f"📌 Found existing position: {symbol}")
-    
+    # Тест балансу при старті
+    bal = mexc_client.get_wallet_balance()
+    logging.info(f"🏁 Startup Futures Balance: {bal} USDT")
+
     application = ApplicationBuilder().token(token).post_init(post_init).build()
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
-    logging.info("🤖 Bot started successfully!")
-    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
