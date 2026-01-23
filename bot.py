@@ -631,12 +631,12 @@ async def post_init(application):
     if target_id:
         try:
             stats = position_tracker.get_statistics()
+            dry_run_mode = os.getenv('DRY_RUN', 'false').lower() == 'true'
+            mode_text = 'DRY RUN' if dry_run_mode else 'LIVE TRADING'
             
-            await application.bot.send_message(
-                chat_id=target_id,
-                text=f"""🚀 <b>MEXC Copy Bot Started</b>
+            message = f"""🚀 <b>MEXC Copy Bot Started</b>
 
-✅ Mode: {'DRY RUN' if os.getenv('DRY_RUN', 'false').lower() == 'true' else 'LIVE TRADING'}
+✅ Mode: {mode_text}
 📊 Leverage: {os.getenv('LEVERAGE', 20)}x
 💰 Risk: {os.getenv('RISK_PERCENTAGE', 2.5)}%
 🛑 Stop Loss: {os.getenv('STOP_LOSS_PERCENT', 0.5)}%
@@ -648,7 +648,11 @@ Open Positions: {stats['open_positions']}
 Total Trades: {stats['total_trades']}
 Win Rate: {(stats['win_trades']/stats['total_trades']*100) if stats['total_trades'] > 0 else 0:.1f}%
 Total P&L: ${stats['total_pnl']:.2f}
-""",
+"""
+            
+            await application.bot.send_message(
+                chat_id=target_id,
+                text=message,
                 parse_mode='HTML'
             )
         except Exception as e:
