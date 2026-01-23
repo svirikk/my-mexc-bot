@@ -92,7 +92,7 @@ class MexcWebClient:
 
     def get_wallet_balance(self):
         """
-        ✅ ВИПРАВЛЕНО: Правильний endpoint для futures балансу
+        ✅ ВИПРАВЛЕНО: Використовуємо правильний MEXC Futures API endpoint
         """
         try:
             if not self.config_obj:
@@ -103,7 +103,7 @@ class MexcWebClient:
             
             # Генеруємо p0, k0 для шифрування
             p0, k0 = self.crypto.encrypt_request({
-                "hostname": "www.mexc.com",
+                "hostname": "contract.mexc.com",
                 "mhash": mhash,
                 "mtoken": self.crypto.mtoken,
                 "platform_type": 3,
@@ -137,27 +137,18 @@ class MexcWebClient:
                 "x-mxc-sign": x_mxc_sign
             }
             
-            # ✅ ВИПРАВЛЕНО: Правильний endpoint для futures
-            url = "https://www.mexc.com/api/platform/futures/api/v1/private/account/asset"
+            # ✅ ПРАВИЛЬНИЙ ENDPOINT: contract.mexc.com для futures
+            url = "https://contract.mexc.com/api/v1/private/account/assets"
             
-            resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
+            resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
             data = resp.json()
             
             logging.info(f"📊 Balance API Response: {data}")
             
-            if data.get("code") != 200:
-                logging.warning(f"⚠️ API Response code {data.get('code')}: {data.get('message')}")
-                
-                # ✅ Якщо 404, спробуємо альтернативний endpoint
-                if data.get("code") == 404:
-                    logging.info("🔄 Trying alternative endpoint...")
-                    url_alt = "https://www.mexc.com/api/platform/futures/api/v1/private/account/assets"
-                    resp_alt = self.session.post(url_alt, data=body_json, headers=headers, timeout=10)
-                    data = resp_alt.json()
-                    logging.info(f"📊 Alternative API Response: {data}")
-                
-                if data.get("code") != 200:
-                    return 0.0
+            # Перевірка успішності
+            if not data.get("success") and data.get("code") != 200:
+                logging.warning(f"⚠️ API Response: {data}")
+                return 0.0
             
             # Парсинг балансу
             balance_data = data.get("data", {})
@@ -170,11 +161,15 @@ class MexcWebClient:
                     balance_data.get("availableBal") or 
                     balance_data.get("available") or 
                     balance_data.get("equity") or 
+                    balance_data.get("totalBalance") or
                     0
                 )
             elif isinstance(balance_data, list) and len(balance_data) > 0:
-                # Якщо це масив балансів
-                available = float(balance_data[0].get("availableBalance", 0))
+                # Якщо це масив балансів, беремо перший USDT
+                for item in balance_data:
+                    if item.get("currency") == "USDT" or item.get("asset") == "USDT":
+                        available = float(item.get("availableBalance", 0))
+                        break
             
             logging.info(f"✅ MEXC Futures Balance: {available} USDT")
             return available
