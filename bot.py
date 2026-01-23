@@ -92,19 +92,35 @@ class MexcWebClient:
 
     def get_wallet_balance(self):
         try:
-            url = f"https://www.mexc.com/api/platform/asset/api/v1/private/asset/account/detail?currency=USDT&ts={int(time.time()*1000)}"
+            # Оновлений шлях до ф'ючерсного балансу
+            ts = int(time.time() * 1000)
+            url = f"https://www.mexc.com/api/platform/futures/api/v1/private/account/asset/list?ts={ts}"
+            
             resp = self.session.get(url, headers=self.base_headers, timeout=10)
             data = resp.json()
             
-            # Лог для діагностики, якщо щось піде не так
-            if not data.get("success"):
-                logging.warning(f"⚠️ Помилка отримання балансу: {data}")
-                
-            for b in data.get("data", {}).get("balances", []):
-                if b["currency"] == "USDT": return float(b.get("available", 0))
+            if data.get("code") != 200:
+                logging.warning(f"⚠️ Не вдалося отримати ф'ючерсний баланс: {data}")
+                # Спробуємо альтернативний шлях для спотового балансу, якщо ф'ючерсний не відповів
+                url_spot = f"https://www.mexc.com/api/platform/asset/api/v1/private/asset/account/assets?currency=USDT&ts={ts}"
+                resp = self.session.get(url_spot, headers=self.base_headers, timeout=10)
+                data = resp.json()
+
+            # Парсинг даних (структура ф'ючерсного API MEXC)
+            if data.get("success") or data.get("code") == 200:
+                assets = data.get("data", [])
+                if isinstance(assets, list):
+                    for asset in assets:
+                        if asset.get("currency") == "USDT":
+                            return float(asset.get("available", 0))
+                elif isinstance(assets, dict): # Для спотового варіанту
+                    for asset in assets.get("balances", []):
+                        if asset.get("currency") == "USDT":
+                            return float(asset.get("available", 0))
+            
             return 0.0
         except Exception as e: 
-            logging.error(f"❌ Exception при отриманні балансу: {e}")
+            logging.error(f"❌ Помилка при запиті балансу: {e}")
             return 0.0
 
     def place_order(self, symbol, direction, quantity, leverage):
