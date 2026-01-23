@@ -20,7 +20,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 if os.path.exists('.env'):
     load_dotenv()
 
-# 2. Логування
+# 2. Логування (DEBUG рівень для пошуку помилок)
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -85,7 +85,6 @@ class MexcWebClient:
             resp = self.session.post(url, json=payload, headers=self.base_headers, timeout=10)
             data = resp.json()
             decrypted = self.crypto.sigma_decrypt(data["data"])
-            # Беремо індекс 27 або намагаємось знайти об'єкт з chash
             self.config_obj = decrypted[27] if len(decrypted) > 27 else decrypted[-1]
             logging.info("✅ MEXC Конфігурація отримана.")
         except Exception as e:
@@ -95,10 +94,18 @@ class MexcWebClient:
         try:
             url = f"https://www.mexc.com/api/platform/asset/api/v1/private/asset/account/detail?currency=USDT&ts={int(time.time()*1000)}"
             resp = self.session.get(url, headers=self.base_headers, timeout=10)
-            for b in resp.json().get("data", {}).get("balances", []):
+            data = resp.json()
+            
+            # Лог для діагностики, якщо щось піде не так
+            if not data.get("success"):
+                logging.warning(f"⚠️ Помилка отримання балансу: {data}")
+                
+            for b in data.get("data", {}).get("balances", []):
                 if b["currency"] == "USDT": return float(b.get("available", 0))
             return 0.0
-        except Exception: return 0.0
+        except Exception as e: 
+            logging.error(f"❌ Exception при отриманні балансу: {e}")
+            return 0.0
 
     def place_order(self, symbol, direction, quantity, leverage):
         if not self.config_obj: self.refresh_config()
@@ -109,7 +116,6 @@ class MexcWebClient:
             "hostname": "www.mexc.com", "mhash": mhash, "mtoken": self.crypto.mtoken, "platform_type": 3
         })
         
-        # Створення тіла запиту точно як у файлі 1.py
         body_dict = {
             "symbol": symbol,
             "side": 1 if direction == "LONG" else 3,
@@ -119,12 +125,8 @@ class MexcWebClient:
             "leverage": int(leverage),
             "marketCeiling": False,
             "priceProtect": "0",
-            "p0": p0,
-            "k0": k0,
-            "chash": self.config_obj["chash"],
-            "mtoken": self.crypto.mtoken,
-            "ts": ts,
-            "mhash": mhash
+            "p0": p0, "k0": k0, "chash": self.config_obj["chash"],
+            "mtoken": self.crypto.mtoken, "ts": ts, "mhash": mhash
         }
         
         body_json = json.dumps(body_dict, separators=(",", ":"))
@@ -134,17 +136,11 @@ class MexcWebClient:
         if os.getenv("DRY_RUN", "false").lower() == "true":
             return {"success": True, "dry_run": True}
         
-        headers = {
-            **self.base_headers,
-            "x-mxc-nonce": ts,
-            "x-mxc-sign": x_mxc_sign
-        }
+        headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
         
         try:
-            r = self.session.post(
-                "https://www.mexc.com/api/platform/futures/api/v1/private/order/create",
-                data=body_json, headers=headers, timeout=10
-            )
+            r = self.session.post("https://www.mexc.com/api/platform/futures/api/v1/private/order/create", 
+                                data=body_json, headers=headers, timeout=10)
             return r.json()
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -158,66 +154,110 @@ mexc_client = None
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global mexc_client
     target_id = str(os.getenv("SIGNAL_CHANNEL_ID", "")).strip()
-    if str(update.effective_chat.id).strip() != target_id:
+    current_id = str(update.effective_chat.id).strip()
+    
+    # 1. Логуємо факт отримання будь-якого посту
+    logging.info(f"📩 POST received. Channel ID: {current_id}")
+
+    if current_id != target_id:
+        logging.info(f"⏭ Skipped: Wrong channel ID (Target: {target_id})")
         return
 
     msg_text = update.channel_post.text or update.channel_post.caption or ""
     json_match = re.search(r'(\{.*\})', msg_text, re.DOTALL)
-    if not json_match: return
+    
+    if not json_match:
+        logging.info("ℹ️ Skipped: No JSON found in message")
+        return
         
     try:
         data = json.loads(json_match.group(1))
-        symbol = str(data['symbol']).upper()
+        symbol = str(data.get('symbol', '')).upper()
         signal_type = str(data.get('signalType', '')).upper()
         price = float(data['stats']['lastPrice'])
         
-        # Вибір напрямку (Reversal)
+        logging.info(f"🔎 Processing Signal: {symbol} | Type: {signal_type} | Price: {price}")
+        
+        # Вибір напрямку
         my_direction = None
         if signal_type == "LONG_FLUSH": my_direction = "LONG"
         elif signal_type == "SHORT_SQUEEZE": my_direction = "SHORT"
         
-        if not my_direction: return
+        if not my_direction: 
+            logging.info(f"⏭ Skipped: Unknown Signal Type {signal_type}")
+            return
 
         # Перевірка фільтрів
         allowed = [s.strip().upper() for s in os.getenv("ALLOWED_SYMBOLS", "").split(",")]
-        if symbol not in allowed or symbol in active_positions: return
+        
+        if symbol not in allowed:
+            logging.warning(f"🚫 Skipped: {symbol} is not in ALLOWED_SYMBOLS")
+            return
+            
+        if symbol in active_positions:
+            logging.warning(f"⏳ Skipped: Position already active for {symbol}")
+            return
 
         # Розрахунок
         balance = mexc_client.get_wallet_balance()
-        risk_usd = balance * (float(os.getenv("RISK_PERCENTAGE", 2.5)) / 100)
-        qty = int((risk_usd / (float(os.getenv("STOP_LOSS_PERCENT", 0.5)) / 100)) / price)
-
-        res = mexc_client.place_order(symbol, my_direction, qty or 1, int(os.getenv("LEVERAGE", 20)))
+        logging.info(f"💰 Current Balance: {balance} USDT")
         
+        if balance < 5:
+            logging.error("❌ Balance too low or token expired (Balance = 0)")
+            return
+
+        risk_usd = balance * (float(os.getenv("RISK_PERCENTAGE", 2.5)) / 100)
+        sl_percent = float(os.getenv("STOP_LOSS_PERCENT", 0.5)) / 100
+        qty = int((risk_usd / sl_percent) / price)
+        
+        if qty < 1: qty = 1
+        
+        logging.info(f"🚀 Placing Order: {my_direction} {symbol}, Qty: {qty}, Risk: ${risk_usd:.2f}")
+
+        res = mexc_client.place_order(symbol, my_direction, qty, int(os.getenv("LEVERAGE", 20)))
+        
+        # ЛОГІКА ОБРОБКИ РЕЗУЛЬТАТУ
         if res.get("success") or res.get("code") == 200 or res.get("dry_run"):
             active_positions[symbol] = True
-            await context.bot.send_message(chat_id=target_id, text=f"✅ ПОРТФЕЛЬ: {my_direction} {symbol}\nВхід: {price}")
+            
+            mode_text = "TEST MODE" if res.get("dry_run") else "REAL TRADE"
+            await context.bot.send_message(
+                chat_id=target_id, 
+                text=f"✅ {mode_text}: {my_direction} {symbol}\n💰 Вхід: {price}\n📊 К-ть: {qty}"
+            )
+            logging.info(f"✅ Order executed successfully: {res}")
+        else:
+            # ОСЬ ЧОГО НЕ ВИСТАЧАЛО: Логування помилки
+            logging.error(f"❌ ORDER FAILED. Exchange response: {res}")
+            await context.bot.send_message(
+                chat_id=target_id, 
+                text=f"❌ Помилка відкриття угоди {symbol}:\n{res.get('msg') or res.get('error') or res}"
+            )
+
     except Exception as e:
-        logging.error(f"Помилка обробки: {e}")
+        logging.error(f"❌ CRITICAL ERROR in handler: {e}", exc_info=True)
 
 async def post_init(application):
     target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
     if target_id:
         try:
-            await application.bot.send_message(chat_id=target_id, text="🚀 Бот запущено успішно! Очікую на сигнали.")
+            await application.bot.send_message(chat_id=target_id, text="🚀 Бот перезапущено. Debug Mode: ON")
         except Exception as e:
-            logging.error(f"Помилка відправки старту: {e}")
+            logging.error(f"Post-init error: {e}")
 
 def main():
     global mexc_client
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     mexc_token = os.getenv("MEXC_TOKEN", "").strip()
     
-    if not token or not mexc_token:
-        logging.error("❌ Критично: Відсутні токени!")
-        return
+    if not token: return
 
     mexc_client = MexcWebClient(mexc_token)
     
     application = ApplicationBuilder().token(token).post_init(post_init).build()
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
-    logging.info("🤖 Бот стартує...")
+    logging.info("🤖 System starting...")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
