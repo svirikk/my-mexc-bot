@@ -93,7 +93,7 @@ class MexcWebClient:
         except Exception as e:
             logging.error(f"❌ Config Error: {e}")
 
-    def _make_signed_request(self, url, body_dict):
+    def _make_signed_request(self, url, body_dict, method="POST"):
         """Універсальний підписаний запит"""
         try:
             if not self.config_obj:
@@ -124,7 +124,11 @@ class MexcWebClient:
             
             headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
             
-            resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
+            if method == "GET":
+                resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
+            else:
+                resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
+            
             return resp.json()
             
         except Exception as e:
@@ -135,7 +139,9 @@ class MexcWebClient:
         """Баланс через Web API"""
         try:
             url = "https://contract.mexc.com/api/v1/private/account/assets"
-            result = self._make_signed_request(url, {})
+            result = self._make_signed_request(url, {}, method="GET")
+            
+            logging.info(f"📊 Full Balance Response: {json.dumps(result, indent=2)}")
             
             if not result.get("success"):
                 logging.warning(f"⚠️ Balance API: {result}")
@@ -151,19 +157,21 @@ class MexcWebClient:
             
             return 0.0
         except Exception as e:
-            logging.error(f"❌ Balance error: {e}")
+            logging.error(f"❌ Balance error: {e}", exc_info=True)
             return 0.0
 
     def get_open_positions(self):
         """Відкриті позиції через Web API"""
         try:
             url = "https://contract.mexc.com/api/v1/private/position/open_positions"
-            result = self._make_signed_request(url, {})
+            result = self._make_signed_request(url, {}, method="GET")
             
             if not result.get("success"):
+                logging.warning(f"⚠️ Positions: {result}")
                 return []
             
             return result.get("data", [])
+            
         except Exception as e:
             logging.error(f"❌ Positions error: {e}")
             return []
@@ -580,14 +588,15 @@ def main():
             logging.info(f"📌 Existing position: {symbol}")
     
     # Telegram
-    application = ApplicationBuilder().token(telegram_token).post_init(post_init).build()
+    application = ApplicationBuilder().token(telegram_token).build()
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
-    # Запуск моніторингу
-    async def start_monitoring(app):
+    # ✅ ВИПРАВЛЕНО: правильний спосіб додавання post_init
+    async def init_and_start_monitoring(app):
+        await post_init(app)
         asyncio.create_task(position_monitoring_loop(mexc_web, position_manager, app))
     
-    application.post_init(start_monitoring)
+    application.post_init(init_and_start_monitoring)
     
     logging.info("🤖 Bot started!")
     application.run_polling(drop_pending_updates=True)
