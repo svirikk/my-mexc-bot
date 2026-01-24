@@ -623,16 +623,20 @@ def main():
         if symbol:
             logging.info(f"📌 Existing position: {symbol}")
     
-    # Telegram
-    application = ApplicationBuilder().token(telegram_token).build()
-    application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
-    
-    # ✅ ВИПРАВЛЕНО: правильний спосіб додавання post_init
+    # ✅ ВИПРАВЛЕНО: Правильна ініціалізація з post_init
     async def init_and_start_monitoring(app):
         await post_init(app)
         asyncio.create_task(position_monitoring_loop(mexc_web, position_manager, app))
     
-    application.post_init(init_and_start_monitoring)
+    # Telegram app з post_init
+    application = (
+        ApplicationBuilder()
+        .token(telegram_token)
+        .post_init(init_and_start_monitoring)
+        .build()
+    )
+    
+    application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
     logging.info("🤖 Bot started!")
     application.run_polling(drop_pending_updates=True)
