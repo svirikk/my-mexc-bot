@@ -94,63 +94,64 @@ class MexcWebClient:
             logging.error(f"❌ Config Error: {e}")
 
     def _make_signed_request(self, url, body_dict, method="POST"):
-    """Універсальний підписаний запит"""
-    try:
-        if not self.config_obj:
-            self.refresh_config()
-        
-        ts = str(int(time.time() * 1000))
-        mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
-        
-        p0, k0 = self.crypto.encrypt_request({
-            "hostname": "contract.mexc.com",
-            "mhash": mhash,
-            "mtoken": self.crypto.mtoken,
-            "platform_type": 3,
-            "product_type": 0
-        })
-        
-        body_dict.update({
-            "p0": p0, "k0": k0,
-            "chash": self.config_obj["chash"],
-            "mtoken": self.crypto.mtoken,
-            "ts": ts,
-            "mhash": mhash
-        })
-        
-        body_json = json.dumps(body_dict, separators=(",", ":"))
-        inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
-        x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
-        
-        headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
-        
-        # ✅ ВИПРАВЛЕННЯ: Логування запиту
-        logging.info(f"🔗 Request: {method} {url}")
-        
-        if method == "GET":
-            resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
-        else:
-            resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
-        
-        # ✅ ВИПРАВЛЕННЯ: Перевірка статусу
-        logging.info(f"📥 Response status: {resp.status_code}")
-        logging.info(f"📥 Response text: {resp.text[:500]}")  # Перші 500 символів
-        
-        # ✅ ВИПРАВЛЕННЯ: Перевірка чи це JSON
-        if not resp.text.strip():
-            logging.error("❌ Empty response from server")
-            return {"success": False, "error": "Empty response"}
-        
+        """Універсальний підписаний запит - ВИПРАВЛЕНА ВЕРСІЯ"""
         try:
-            return resp.json()
-        except json.JSONDecodeError as e:
-            logging.error(f"❌ JSON decode error: {e}")
-            logging.error(f"❌ Response was: {resp.text}")
-            return {"success": False, "error": f"Invalid JSON: {resp.text[:100]}"}
-        
-    except Exception as e:
-        logging.error(f"❌ Request error: {e}", exc_info=True)
-        return {"success": False, "error": str(e)}
+            if not self.config_obj:
+                self.refresh_config()
+            
+            ts = str(int(time.time() * 1000))
+            mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
+            
+            p0, k0 = self.crypto.encrypt_request({
+                "hostname": "contract.mexc.com",
+                "mhash": mhash,
+                "mtoken": self.crypto.mtoken,
+                "platform_type": 3,
+                "product_type": 0
+            })
+            
+            body_dict.update({
+                "p0": p0, "k0": k0,
+                "chash": self.config_obj["chash"],
+                "mtoken": self.crypto.mtoken,
+                "ts": ts,
+                "mhash": mhash
+            })
+            
+            body_json = json.dumps(body_dict, separators=(",", ":"))
+            inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
+            x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
+            
+            headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
+            
+            # Логування запиту
+            logging.info(f"🔗 Request: {method} {url}")
+            
+            if method == "GET":
+                resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
+            else:
+                resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
+            
+            # Логування відповіді
+            logging.info(f"📥 Response status: {resp.status_code}")
+            logging.info(f"📥 Response text: {resp.text[:500]}")
+            
+            # Перевірка чи response не порожній
+            if not resp.text.strip():
+                logging.error("❌ Empty response from server")
+                return {"success": False, "error": "Empty response"}
+            
+            # Спроба парсингу JSON
+            try:
+                return resp.json()
+            except json.JSONDecodeError as e:
+                logging.error(f"❌ JSON decode error: {e}")
+                logging.error(f"❌ Response was: {resp.text}")
+                return {"success": False, "error": f"Invalid JSON: {resp.text[:100]}"}
+            
+        except Exception as e:
+            logging.error(f"❌ Request error: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
 
     def get_balance(self):
         """Баланс ТІЛЬКИ Futures USDT"""
@@ -164,7 +165,6 @@ class MexcWebClient:
 
             data = result.get("data", [])
             
-            # ✅ ТІЛЬКИ USDT Futures
             if isinstance(data, list):
                 for item in data:
                     if item.get("currency") == "USDT":
@@ -196,17 +196,14 @@ class MexcWebClient:
             return []
 
     def place_market_order(self, symbol, direction, quantity, leverage):
-        """
-        Відкриття позиції Market ордером
-        side: 1=Open Long, 3=Open Short
-        """
+        """Відкриття позиції Market ордером"""
         side = 1 if direction == "LONG" else 3
         
         body_dict = {
             "symbol": symbol,
             "side": side,
-            "openType": 1,  # Isolated margin
-            "type": "5",    # Market order
+            "openType": 1,
+            "type": "5",
             "vol": int(quantity),
             "leverage": int(leverage),
             "marketCeiling": False,
@@ -224,16 +221,12 @@ class MexcWebClient:
         return result
 
     def place_limit_order(self, symbol, side, price, quantity):
-        """
-        Лімітний ордер для TP/SL
-        side: 2=Close Long, 4=Close Short
-        type: 1=Limit Order
-        """
+        """Лімітний ордер для TP/SL"""
         body_dict = {
             "symbol": symbol,
             "side": side,
             "openType": 1,
-            "type": "1",  # Limit order
+            "type": "1",
             "price": str(price),
             "vol": int(quantity),
             "marketCeiling": False,
@@ -251,16 +244,12 @@ class MexcWebClient:
         return result
 
     def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
-        """
-        Виставлення TP і SL після відкриття позиції
-        """
+        """Виставлення TP і SL після відкриття позиції"""
         results = {"tp": None, "sl": None}
         
-        # Для LONG: Close = Sell (side=2), для SHORT: Close = Buy (side=4)
         close_side = 2 if direction == "LONG" else 4
         
         try:
-            # Take Profit (лімітний ордер на закриття)
             tp_result = self.place_limit_order(symbol, close_side, tp_price, quantity)
             results["tp"] = tp_result
             
@@ -269,9 +258,8 @@ class MexcWebClient:
             else:
                 logging.error(f"❌ TP failed: {tp_result}")
             
-            time.sleep(0.5)  # Невелика затримка
+            time.sleep(0.5)
             
-            # Stop Loss (лімітний ордер на закриття)
             sl_result = self.place_limit_order(symbol, close_side, sl_price, quantity)
             results["sl"] = sl_result
             
@@ -410,33 +398,25 @@ def calculate_risk_params(balance, price, direction):
         return None
 
 # ==========================================
-# 🔄 OPTIMIZED MONITORING LOOP
+# 🔄 MONITORING LOOP
 # ==========================================
 async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionManager, context):
-    """
-    ✅ ОПТИМІЗОВАНИЙ моніторинг:
-    - Перевіряє ТІЛЬКИ коли є активні позиції
-    - Інтервал 10 секунд (не 5)
-    - Немає зайвих запитів балансу
-    """
-    logging.info("🔄 Monitoring started (optimized mode)")
+    """Оптимізований моніторинг"""
+    logging.info("🔄 Monitoring started")
     
-    check_interval = 10  # секунд
+    check_interval = 10
     last_balance_check = 0
-    balance_check_cooldown = 300  # баланс раз на 5 хвилин
+    balance_check_cooldown = 300
     
     while True:
         try:
-            # ✅ Перевіряємо позиції ТІЛЬКИ якщо є активні
             if len(manager.positions) == 0:
                 await asyncio.sleep(check_interval)
                 continue
             
-            # Отримуємо позиції з біржі
             exchange_positions = web_client.get_open_positions()
             manager.update_from_exchange(exchange_positions)
             
-            # Обробка позицій що потребують TP/SL
             for symbol, managed in list(manager.positions.items()):
                 
                 if managed.state == PositionState.POSITION_DETECTED and not managed.sl_order_placed:
@@ -453,7 +433,6 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                     
                     manager.mark_sl_tp_placed(symbol)
                     
-                    # Сповіщення
                     target_id = os.getenv("SIGNAL_CHANNEL_ID")
                     tp_change = ((managed.target_tp / managed.entry_price - 1) * 100) if managed.signal_direction == "LONG" else ((1 - managed.target_tp / managed.entry_price) * 100)
                     sl_change = ((1 - managed.target_sl / managed.entry_price) * 100) if managed.signal_direction == "LONG" else ((managed.target_sl / managed.entry_price - 1) * 100)
@@ -471,7 +450,6 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                     )
                     await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
             
-            # ✅ Баланс перевіряємо рідко (раз на 5 хв)
             current_time = time.time()
             if current_time - last_balance_check > balance_check_cooldown:
                 balance = web_client.get_balance()
@@ -482,7 +460,7 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
             
         except Exception as e:
             logging.error(f"❌ Monitoring error: {e}", exc_info=True)
-            await asyncio.sleep(30)  # При помилці чекаємо довше
+            await asyncio.sleep(30)
 
 # ==========================================
 # 🤖 TELEGRAM HANDLER
@@ -531,7 +509,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             logging.info(f"⏭️ {symbol_api} already managed")
             return
 
-        # ✅ Перевіряємо баланс ТІЛЬКИ при новому сигналі
         balance = mexc_web.get_balance()
         logging.info(f"💰 Balance for trade: {balance} USDT")
         
@@ -548,12 +525,10 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not risk:
             return
         
-        # Додаємо сигнал до менеджера
         position_manager.add_signal(symbol_api, my_direction, risk['sl_price'], risk['tp_price'])
         
         logging.info(f"🚀 Opening {my_direction} {symbol_api}, Qty: {risk['qty']}")
 
-        # Відкриваємо позицію
         res = mexc_web.place_market_order(
             symbol=symbol_api,
             direction=my_direction,
@@ -629,23 +604,19 @@ def main():
     mexc_web = MexcWebClient(web_token)
     position_manager = PositionManager()
     
-    # Перевірка балансу
     balance = mexc_web.get_balance()
     logging.info(f"🎯 Startup Balance: {balance} USDT")
     
-    # Синхронізація існуючих позицій
     existing = mexc_web.get_open_positions()
     for pos in existing:
         symbol = pos.get("symbol")
         if symbol:
             logging.info(f"📌 Existing position: {symbol}")
     
-    # ✅ ВИПРАВЛЕНО: Правильна ініціалізація з post_init
     async def init_and_start_monitoring(app):
         await post_init(app)
         asyncio.create_task(position_monitoring_loop(mexc_web, position_manager, app))
     
-    # Telegram app з post_init
     application = (
         ApplicationBuilder()
         .token(telegram_token)
