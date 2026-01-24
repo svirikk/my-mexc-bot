@@ -98,6 +98,56 @@ class MexcWebClient:
         except Exception as e:
             logging.error(f"❌ Config Refresh Error: {e}")
 
+    def get_wallet_balance(self):
+        """Отримання балансу через веб-токен"""
+        try:
+            if not self.config_obj:
+                self.refresh_config()
+            
+            ts = str(int(time.time() * 1000))
+            mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
+            
+            p0, k0 = self.crypto.encrypt_request({
+                "hostname": "contract.mexc.com",
+                "mhash": mhash,
+                "mtoken": self.crypto.mtoken,
+                "platform_type": 3,
+                "product_type": 0
+            })
+            
+            body_dict = {
+                "p0": p0, "k0": k0, "chash": self.config_obj["chash"],
+                "mtoken": self.crypto.mtoken, "ts": ts, "mhash": mhash
+            }
+            
+            body_json = json.dumps(body_dict, separators=(",", ":"))
+            inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
+            x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
+            
+            headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
+            
+            url = "https://contract.mexc.com/api/v1/private/account/assets"
+            
+            resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
+            data = resp.json()
+            
+            if not data.get("success"):
+                logging.warning(f"⚠️ Balance API Warning: {data}")
+                return 0.0
+
+            balance_data = data.get("data", [])
+            if isinstance(balance_data, list):
+                for item in balance_data:
+                    if item.get("currency") == "USDT":
+                        bal = float(item.get("availableBalance", 0))
+                        logging.info(f"💰 Web Client USDT balance: {bal}")
+                        return bal
+            
+            return 0.0
+        except Exception as e:
+            logging.error(f"❌ Balance Exception: {e}", exc_info=True)
+            return 0.0
+
     def place_order(self, symbol, direction, quantity, leverage):
         """ВІДКРИТТЯ позиції через веб-токен (єдиний спосіб)"""
         if not self.config_obj:
@@ -153,7 +203,10 @@ class MexcWebClient:
 # 📊 MEXC API CLIENT (МОНІТОРИНГ)
 # ==========================================
 class MexcMonitoringAPI:
-    """API-клієнт для МОНІТОРИНГУ позицій через API Key/Secret"""
+    """
+    MEXC USDT-M Futures API Client (READ-ONLY)
+    BASE URL: https://contract.mexc.com
+    """
     
     BASE_URL = "https://contract.mexc.com"
     
@@ -162,30 +215,46 @@ class MexcMonitoringAPI:
         self.api_secret = api_secret.strip()
         self.session = requests.Session()
     
-    def _sign(self, params: Dict) -> str:
-        """HMAC-SHA256 підпис"""
-        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-        return hmac.new(
+    def _generate_signature(self, query_string: str, request_time: str) -> str:
+        """
+        HMAC-SHA256 підпис
+        signature = HMAC_SHA256(secret_key, query_string + Request-Time)
+        """
+        message = query_string + request_time
+        signature = hmac.new(
             self.api_secret.encode('utf-8'),
-            query_string.encode('utf-8'),
+            message.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
+        return signature
     
     def _request(self, method: str, endpoint: str, params: Dict = None) -> Dict:
         """Аутентифікований API запит"""
         params = params or {}
-        params['timestamp'] = int(time.time() * 1000)
-        params['recv_window'] = 5000
         
-        signature = self._sign(params)
-        params['signature'] = signature
+        # Request-Time в мілісекундах
+        request_time = str(int(time.time() * 1000))
         
+        # Query string для підпису
+        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+        
+        # Генеруємо підпис
+        signature = self._generate_signature(query_string, request_time)
+        
+        # Headers згідно специфікації
         headers = {
-            'X-MEXC-APIKEY': self.api_key,
+            'ApiKey': self.api_key,
+            'Request-Time': request_time,
+            'Signature': signature,
             'Content-Type': 'application/json'
         }
         
         url = f"{self.BASE_URL}{endpoint}"
+        
+        # Детальне логування
+        logging.info(f"🔗 {method} {url}")
+        if query_string:
+            logging.info(f"📝 Query: {query_string}")
         
         try:
             if method == "GET":
@@ -193,41 +262,97 @@ class MexcMonitoringAPI:
             else:
                 resp = self.session.post(url, json=params, headers=headers, timeout=10)
             
-            return resp.json()
+            logging.info(f"📥 Status: {resp.status_code}")
+            
+            result = resp.json()
+            
+            if not result.get("success"):
+                logging.warning(f"⚠️ API Response: {result}")
+            
+            return result
+            
         except Exception as e:
-            logging.error(f"API request error: {e}")
+            logging.error(f"❌ Request exception: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     def get_account_assets(self) -> List[Dict]:
-        """Баланс рахунку"""
-        result = self._request("GET", "/api/v1/private/account/assets")
+        """
+        GET /api/v1/private/account/assets
+        Повертає баланс USDT-M Futures
+        """
+        result = self._request("GET", "/api/v1/private/account/assets", {})
+        
         if result.get("success"):
-            return result.get("data", [])
-        return []
+            data = result.get("data", [])
+            return data
+        else:
+            logging.error(f"❌ Assets error: {result}")
+            return []
     
     def get_usdt_balance(self) -> float:
-        """Доступний USDT баланс"""
+        """
+        Отримати availableBalance для USDT
+        """
         assets = self.get_account_assets()
+        
         for asset in assets:
             if asset.get("currency") == "USDT":
-                return float(asset.get("availableBalance", 0))
+                available = float(asset.get("availableBalance", 0))
+                equity = float(asset.get("equity", 0))
+                unrealized = float(asset.get("unrealized", 0))
+                
+                logging.info(f"💰 USDT Balance:")
+                logging.info(f"   Available: {available}")
+                logging.info(f"   Equity: {equity}")
+                logging.info(f"   Unrealized PnL: {unrealized}")
+                
+                return available
+        
+        logging.warning("⚠️ USDT not found in assets response")
         return 0.0
     
     def get_open_positions(self) -> List[Dict]:
-        """Відкриті позиції"""
-        result = self._request("GET", "/api/v1/private/position/open_positions", {"symbol": ""})
+        """
+        GET /api/v1/private/position/open_positions
+        Повертає відкриті позиції
+        """
+        result = self._request("GET", "/api/v1/private/position/open_positions", {})
+        
         if result.get("success"):
             positions = result.get("data", [])
-            # Фільтруємо тільки активні позиції
-            return [p for p in positions if abs(float(p.get("holdVol", 0))) > 0]
-        return []
+            
+            # Фільтруємо тільки активні (vol > 0)
+            active = []
+            for pos in positions:
+                vol = float(pos.get("vol", 0))
+                if vol > 0:
+                    active.append(pos)
+                    logging.info(f"✅ Active position: {pos.get('symbol')} {pos.get('holdSide')} vol={vol}")
+            
+            return active
+        else:
+            logging.error(f"❌ Positions error: {result}")
+            return []
+    
+    def get_position_details(self, position_data: Dict) -> Dict:
+        """
+        Витягти деталі з позиції
+        """
+        return {
+            "symbol": position_data.get("symbol"),
+            "side": position_data.get("holdSide"),
+            "size": float(position_data.get("vol", 0)),
+            "entry_price": float(position_data.get("openPrice", 0)),
+            "unrealized_pnl": float(position_data.get("unrealizedPnl", 0)),
+            "position_side": 1 if position_data.get("holdSide") == "long" else 2
+        }
 
 # ==========================================
 # 🎯 STATE MACHINE
 # ==========================================
 class PositionState(Enum):
     NO_POSITION = "no_position"
-    OPENING = "opening"  # Сигнал отримано, чекаємо відкриття
+    OPENING = "opening"
     POSITION_DETECTED = "position_detected"
     SL_TP_SET = "sl_tp_set"
 
@@ -235,11 +360,11 @@ class PositionState(Enum):
 class ManagedPosition:
     symbol: str
     state: PositionState
-    signal_direction: str  # "LONG" or "SHORT"
+    signal_direction: str
     signal_time: float
     current_size: float = 0.0
     entry_price: float = 0.0
-    position_side: int = 0  # 1=long, 2=short
+    position_side: int = 0
     sl_order_placed: bool = False
     tp_order_placed: bool = False
     last_check: float = 0.0
@@ -249,7 +374,7 @@ class PositionManager:
     
     def __init__(self):
         self.positions: Dict[str, ManagedPosition] = {}
-        self.opening_timeout = 30  # секунд на відкриття
+        self.opening_timeout = 30
     
     def add_signal(self, symbol: str, direction: str):
         """Додати новий сигнал"""
@@ -265,7 +390,6 @@ class PositionManager:
         """Синхронізація з біржею"""
         exchange_symbols = {}
         
-        # Індексуємо позиції з біржі
         for pos in exchange_positions:
             symbol = pos.get("symbol")
             size = abs(float(pos.get("holdVol", 0)))
@@ -274,16 +398,13 @@ class PositionManager:
                 exchange_symbols[symbol] = {
                     "size": size,
                     "entry_price": float(pos.get("openAvgPrice", 0)),
-                    "side": pos.get("positionType")  # 1=long, 2=short
+                    "side": pos.get("positionType")
                 }
         
-        # Оновлюємо наші позиції
         for symbol, managed in list(self.positions.items()):
             
             if managed.state == PositionState.OPENING:
-                # Чекаємо на відкриття
                 if symbol in exchange_symbols:
-                    # Позиція відкрилась!
                     ex_pos = exchange_symbols[symbol]
                     managed.state = PositionState.POSITION_DETECTED
                     managed.current_size = ex_pos["size"]
@@ -293,14 +414,11 @@ class PositionManager:
                     logging.info(f"✅ POSITION OPENED: {symbol}, size={ex_pos['size']}, entry={ex_pos['entry_price']}")
                     
                 elif time.time() - managed.signal_time > self.opening_timeout:
-                    # Таймаут - позиція не відкрилась
                     logging.warning(f"⏱️ TIMEOUT: {symbol} position didn't open in {self.opening_timeout}s")
                     del self.positions[symbol]
             
             elif managed.state in [PositionState.POSITION_DETECTED, PositionState.SL_TP_SET]:
-                # Перевіряємо існуючу позицію
                 if symbol in exchange_symbols:
-                    # Позиція ще є
                     ex_pos = exchange_symbols[symbol]
                     prev_size = managed.current_size
                     managed.current_size = ex_pos["size"]
@@ -309,7 +427,6 @@ class PositionManager:
                     if ex_pos["size"] != prev_size:
                         logging.info(f"📊 SIZE CHANGED: {symbol}, {prev_size} → {ex_pos['size']}")
                 else:
-                    # Позиція закрита вручну або SL/TP спрацював
                     logging.warning(f"🚨 POSITION CLOSED: {symbol} (manual or SL/TP)")
                     del self.positions[symbol]
     
@@ -363,41 +480,50 @@ async def position_monitoring_loop(api_client: MexcMonitoringAPI, web_client: Me
                                    manager: PositionManager, context):
     """Цикл моніторингу позицій"""
     
+    logging.info("🔄 Position monitoring loop started")
+    
     while True:
         try:
-            # Отримуємо позиції з біржі через API
             exchange_positions = api_client.get_open_positions()
             
-            # Оновлюємо state manager
-            manager.update_from_exchange(exchange_positions)
+            formatted_positions = []
+            for pos_data in exchange_positions:
+                details = api_client.get_position_details(pos_data)
+                formatted_positions.append({
+                    "symbol": details["symbol"],
+                    "holdVol": details["size"],
+                    "openAvgPrice": details["entry_price"],
+                    "positionType": details["position_side"]
+                })
             
-            # Обробляємо позиції що потребують SL/TP
+            manager.update_from_exchange(formatted_positions)
+            
             for symbol, managed in list(manager.positions.items()):
                 
                 if managed.state == PositionState.POSITION_DETECTED and not managed.sl_order_placed:
-                    # Потрібно виставити SL/TP через WEB CLIENT
-                    logging.info(f"🎯 Setting SL/TP for {symbol} via web API")
+                    logging.info(f"🎯 Need to set SL/TP for {symbol}")
                     
                     sl_pct = float(os.getenv("STOP_LOSS_PERCENT", 0.5))
                     tp_pct = float(os.getenv("TAKE_PROFIT_PERCENT", 0.5))
                     
-                    if managed.position_side == 1:  # LONG
+                    if managed.position_side == 1:
                         sl_price = managed.entry_price * (1 - sl_pct / 100)
                         tp_price = managed.entry_price * (1 + tp_pct / 100)
-                    else:  # SHORT
+                    else:
                         sl_price = managed.entry_price * (1 + sl_pct / 100)
                         tp_price = managed.entry_price * (1 - tp_pct / 100)
                     
-                    # TODO: Тут потрібна функція web_client.place_sl_tp_order()
-                    # Поки що просто позначаємо як встановлені
+                    logging.info(f"📝 Would set SL: ${sl_price:.4f}, TP: ${tp_price:.4f}")
+                    
                     manager.mark_sl_tp_placed(symbol)
                     
-                    # Повідомлення в Telegram
                     target_id = os.getenv("SIGNAL_CHANNEL_ID")
                     msg = (
-                        f"✅ <b>SL/TP SET</b>\n"
+                        f"✅ <b>POSITION CONFIRMED</b>\n"
                         f"<b>Symbol:</b> {symbol}\n"
+                        f"<b>Side:</b> {managed.signal_direction}\n"
                         f"<b>Entry:</b> ${managed.entry_price:.4f}\n"
+                        f"<b>Size:</b> {managed.current_size}\n\n"
                         f"🎯 TP: ${tp_price:.4f}\n"
                         f"🛑 SL: ${sl_price:.4f}"
                     )
@@ -406,7 +532,7 @@ async def position_monitoring_loop(api_client: MexcMonitoringAPI, web_client: Me
             await asyncio.sleep(5)
             
         except Exception as e:
-            logging.error(f"Monitoring loop error: {e}", exc_info=True)
+            logging.error(f"❌ Monitoring loop error: {e}", exc_info=True)
             await asyncio.sleep(10)
 
 # ==========================================
@@ -448,35 +574,38 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not my_direction:
             return
 
-        # Перевірка whitelist
         allowed_str = os.getenv("ALLOWED_SYMBOLS", "").upper()
         if symbol_raw not in allowed_str and f"{symbol_raw}USDT" not in allowed_str:
+            logging.info(f"⏭️ {symbol_raw} not in whitelist")
             return
 
-        # Перевірка чи можемо прийняти сигнал
         if not position_manager.can_accept_signal(symbol_api):
-            logging.info(f"⏭️ SKIPPING {symbol_api} - already managed")
+            logging.info(f"⏭️ {symbol_api} already managed")
             return
 
-        # Отримуємо баланс через API
-        balance = mexc_api.get_usdt_balance()
-        logging.info(f"💰 Balance: {balance} USDT")
+        if mexc_api:
+            balance = mexc_api.get_usdt_balance()
+            if balance == 0.0:
+                logging.warning("⚠️ API balance is 0, trying web client...")
+                balance = mexc_web.get_wallet_balance()
+        else:
+            balance = mexc_web.get_wallet_balance()
+        
+        logging.info(f"💰 Current balance: {balance} USDT")
         
         if balance < 5:
-            logging.error("❌ Balance too low")
+            logging.error("❌ Balance too low for trading")
             return
 
-        # Розраховуємо ризик
         risk = calculate_risk_params(balance, price, my_direction)
         if not risk:
+            logging.error("❌ Risk calculation failed")
             return
         
-        # Реєструємо сигнал
         position_manager.add_signal(symbol_api, my_direction)
         
         logging.info(f"🚀 Opening {my_direction} {symbol_api}, Qty: {risk['qty']}")
 
-        # ВІДКРИВАЄМО ПОЗИЦІЮ через WEB CLIENT
         res = mexc_web.place_order(symbol_api, my_direction, risk['qty'], int(os.getenv("LEVERAGE", 20)))
         
         if res.get("success") or res.get("code") == 200 or res.get("dry_run"):
@@ -488,55 +617,57 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"{header}\n"
                 f"<b>Symbol:</b> {symbol_api}\n"
                 f"<b>Side:</b> {emoji} {my_direction}\n"
-                f"<b>Price:</b> ${price}\n"
+                f"<b>Price:</b> ${price:.4f}\n"
                 f"<b>Qty:</b> {risk['qty']}\n\n"
-                f"⏳ Waiting for position confirmation..."
+                f"⏳ Waiting for position confirmation...\n"
+                f"(will be detected in ~5 seconds)"
             )
             
             await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
         else:
             logging.error(f"❌ Order failed: {res}")
-            # Видаляємо з manager якщо не відкрилось
             if symbol_api in position_manager.positions:
                 del position_manager.positions[symbol_api]
-            await context.bot.send_message(chat_id=target_id, text=f"❌ Error: {res.get('msg') or res}")
+            
+            error_msg = res.get('msg') or res.get('error') or 'Unknown error'
+            await context.bot.send_message(
+                chat_id=target_id, 
+                text=f"❌ <b>ORDER FAILED</b>\n{error_msg}",
+                parse_mode="HTML"
+            )
 
     except Exception as e:
-        logging.error(f"Handler error: {e}", exc_info=True)
+        logging.error(f"❌ Signal handler error: {e}", exc_info=True)
 
-async def post_init(application):
-    target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
-    if target_id:
-        try:
-            mode = "🧪 DRY RUN" if os.getenv("DRY_RUN") == "true" else "🔥 REAL TRADING"
-            await application.bot.send_message(
-                chat_id=target_id,
-                text=f"🚀 MEXC Dual-Mode Bot Online\n"
-                     f"Mode: {mode}\n"
-                     f"📤 Orders: Web Token\n"
-                     f"📊 Monitoring: API Key"
-            )
-        except:
-            pass
-
+# ==========================================
+# 🚀 MAIN
+# ==========================================
 def main():
     global mexc_web, mexc_api, position_manager
     
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    web_token = os.getenv("MEXC_TOKEN", "").strip()  # ✅ ВИПРАВЛЕНО
+    web_token = os.getenv("MEXC_TOKEN", "").strip()
     api_key = os.getenv("MEXC_API_KEY", "").strip()
     api_secret = os.getenv("MEXC_API_SECRET", "").strip()
     
-    if not telegram_token or not web_token:
-        logging.error("❌ Missing tokens")
+    logging.info(f"🔍 Telegram token: {len(telegram_token)} chars")
+    logging.info(f"🔍 MEXC web token: {len(web_token)} chars")
+    logging.info(f"🔍 API key: {len(api_key)} chars")
+    
+    if not telegram_token:
+        logging.error("❌ TELEGRAM_BOT_TOKEN відсутній")
+        return
+    
+    if not web_token:
+        logging.error("❌ MEXC_TOKEN відсутній")
         return
 
-    # Ініціалізація WEB CLIENT (для відкриття позицій)
     mexc_web = MexcWebClient(web_token)
     
-    # Ініціалізація API CLIENT (для моніторингу)
     if api_key and api_secret:
+        logging.info("📊 Initializing API monitoring client...")
         mexc_api = MexcMonitoringAPI(api_key, api_secret)
+        
         balance = mexc_api.get_usdt_balance()
         logging.info(f"💰 Startup Balance: {balance} USDT")
     else:
