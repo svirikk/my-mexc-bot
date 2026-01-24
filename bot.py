@@ -243,14 +243,61 @@ class MexcWebClient:
         logging.info(f"📤 Limit Order: {result}")
         return result
 
-    def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
-        """Виставлення TP і SL після відкриття позиції"""
-        results = {"tp": None, "sl": None}
-        
-        close_side = 2 if direction == "LONG" else 4
-        
-        try:
-            tp_result = self.place_limit_order(symbol, close_side, tp_price, quantity)
+    def place_plan_order(self, symbol, side, trigger_price, quantity, trigger_type="LE"):
+        """
+        План ордер (TP/SL)
+    
+        side: 2=Close Long, 4=Close Short
+        trigger_type: 
+            - "LE" (Less or Equal) для SL на long позиції
+            - "GE" (Greater or Equal) для TP на long позиції
+        """
+    body_dict = {
+        "symbol": symbol,
+        "side": side,
+        "openType": 1,
+        "type": "3",  # Plan order
+        "triggerPrice": str(trigger_price),
+        "triggerType": trigger_type,
+        "executeCycle": "1",  # GTC (Good Till Cancel)
+        "trend": "1",  # Trigger direction
+        "orderType": "5",  # Market order when triggered
+        "vol": int(quantity)
+    }
+    
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        logging.info(f"🧪 DRY RUN: Plan {side} trigger @ ${trigger_price}")
+        return {"success": True, "dry_run": True}
+    
+    url = "https://contract.mexc.com/api/v1/private/planorder/place"
+    result = self._make_signed_request(url, body_dict)
+    
+    logging.info(f"📤 Plan Order: {result}")
+    return result
+
+def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
+    """
+    Виставлення TP і SL після відкриття позиції
+    ВИКОРИСТОВУЄМО PLAN ORDERS
+    """
+    results = {"tp": None, "sl": None}
+    
+    # Для LONG: Close = Sell (side=2), для SHORT: Close = Buy (side=4)
+    close_side = 2 if direction == "LONG" else 4
+    
+    try:
+        if direction == "LONG":
+            # LONG позиція:
+            # TP: ціна піде вгору (GE - Greater or Equal)
+            # SL: ціна піде вниз (LE - Less or Equal)
+            
+            tp_result = self.place_plan_order(
+                symbol=symbol,
+                side=close_side,
+                trigger_price=tp_price,
+                quantity=quantity,
+                trigger_type="GE"
+            )
             results["tp"] = tp_result
             
             if tp_result.get("success"):
@@ -260,7 +307,48 @@ class MexcWebClient:
             
             time.sleep(0.5)
             
-            sl_result = self.place_limit_order(symbol, close_side, sl_price, quantity)
+            sl_result = self.place_plan_order(
+                symbol=symbol,
+                side=close_side,
+                trigger_price=sl_price,
+                quantity=quantity,
+                trigger_type="LE"
+            )
+            results["sl"] = sl_result
+            
+            if sl_result.get("success"):
+                logging.info(f"✅ SL set @ ${sl_price}")
+            else:
+                logging.error(f"❌ SL failed: {sl_result}")
+        
+        else:  # SHORT
+            # SHORT позиція:
+            # TP: ціна піде вниз (LE - Less or Equal)
+            # SL: ціна піде вгору (GE - Greater or Equal)
+            
+            tp_result = self.place_plan_order(
+                symbol=symbol,
+                side=close_side,
+                trigger_price=tp_price,
+                quantity=quantity,
+                trigger_type="LE"
+            )
+            results["tp"] = tp_result
+            
+            if tp_result.get("success"):
+                logging.info(f"✅ TP set @ ${tp_price}")
+            else:
+                logging.error(f"❌ TP failed: {tp_result}")
+            
+            time.sleep(0.5)
+            
+            sl_result = self.place_plan_order(
+                symbol=symbol,
+                side=close_side,
+                trigger_price=sl_price,
+                quantity=quantity,
+                trigger_type="GE"
+            )
             results["sl"] = sl_result
             
             if sl_result.get("success"):
@@ -268,10 +356,10 @@ class MexcWebClient:
             else:
                 logging.error(f"❌ SL failed: {sl_result}")
             
-        except Exception as e:
-            logging.error(f"❌ SL/TP Exception: {e}")
-        
-        return results
+    except Exception as e:
+        logging.error(f"❌ SL/TP Exception: {e}")
+    
+    return results
 
 # ==========================================
 # 🎯 STATE MACHINE
