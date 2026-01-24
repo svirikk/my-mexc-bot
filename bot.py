@@ -94,46 +94,63 @@ class MexcWebClient:
             logging.error(f"❌ Config Error: {e}")
 
     def _make_signed_request(self, url, body_dict, method="POST"):
-        """Універсальний підписаний запит"""
+    """Універсальний підписаний запит"""
+    try:
+        if not self.config_obj:
+            self.refresh_config()
+        
+        ts = str(int(time.time() * 1000))
+        mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
+        
+        p0, k0 = self.crypto.encrypt_request({
+            "hostname": "contract.mexc.com",
+            "mhash": mhash,
+            "mtoken": self.crypto.mtoken,
+            "platform_type": 3,
+            "product_type": 0
+        })
+        
+        body_dict.update({
+            "p0": p0, "k0": k0,
+            "chash": self.config_obj["chash"],
+            "mtoken": self.crypto.mtoken,
+            "ts": ts,
+            "mhash": mhash
+        })
+        
+        body_json = json.dumps(body_dict, separators=(",", ":"))
+        inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
+        x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
+        
+        headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
+        
+        # ✅ ВИПРАВЛЕННЯ: Логування запиту
+        logging.info(f"🔗 Request: {method} {url}")
+        
+        if method == "GET":
+            resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
+        else:
+            resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
+        
+        # ✅ ВИПРАВЛЕННЯ: Перевірка статусу
+        logging.info(f"📥 Response status: {resp.status_code}")
+        logging.info(f"📥 Response text: {resp.text[:500]}")  # Перші 500 символів
+        
+        # ✅ ВИПРАВЛЕННЯ: Перевірка чи це JSON
+        if not resp.text.strip():
+            logging.error("❌ Empty response from server")
+            return {"success": False, "error": "Empty response"}
+        
         try:
-            if not self.config_obj:
-                self.refresh_config()
-            
-            ts = str(int(time.time() * 1000))
-            mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
-            
-            p0, k0 = self.crypto.encrypt_request({
-                "hostname": "contract.mexc.com",
-                "mhash": mhash,
-                "mtoken": self.crypto.mtoken,
-                "platform_type": 3,
-                "product_type": 0
-            })
-            
-            body_dict.update({
-                "p0": p0, "k0": k0,
-                "chash": self.config_obj["chash"],
-                "mtoken": self.crypto.mtoken,
-                "ts": ts,
-                "mhash": mhash
-            })
-            
-            body_json = json.dumps(body_dict, separators=(",", ":"))
-            inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
-            x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
-            
-            headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
-            
-            if method == "GET":
-                resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
-            else:
-                resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
-            
             return resp.json()
-            
-        except Exception as e:
-            logging.error(f"❌ Request error: {e}")
-            return {"success": False, "error": str(e)}
+        except json.JSONDecodeError as e:
+            logging.error(f"❌ JSON decode error: {e}")
+            logging.error(f"❌ Response was: {resp.text}")
+            return {"success": False, "error": f"Invalid JSON: {resp.text[:100]}"}
+        
+    except Exception as e:
+        logging.error(f"❌ Request error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
 
     def get_balance(self):
         """Баланс ТІЛЬКИ Futures USDT"""
