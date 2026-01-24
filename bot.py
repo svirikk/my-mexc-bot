@@ -94,7 +94,7 @@ class MexcWebClient:
             logging.error(f"❌ Config Error: {e}")
 
     def _make_signed_request(self, url, body_dict, method="POST"):
-        """Універсальний підписаний запит - ВИПРАВЛЕНА ВЕРСІЯ"""
+        """Універсальний підписаний запит"""
         try:
             if not self.config_obj:
                 self.refresh_config()
@@ -124,7 +124,6 @@ class MexcWebClient:
             
             headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
             
-            # Логування запиту
             logging.info(f"🔗 Request: {method} {url}")
             
             if method == "GET":
@@ -132,16 +131,13 @@ class MexcWebClient:
             else:
                 resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
             
-            # Логування відповіді
             logging.info(f"📥 Response status: {resp.status_code}")
             logging.info(f"📥 Response text: {resp.text[:500]}")
             
-            # Перевірка чи response не порожній
             if not resp.text.strip():
                 logging.error("❌ Empty response from server")
                 return {"success": False, "error": "Empty response"}
             
-            # Спроба парсингу JSON
             try:
                 return resp.json()
             except json.JSONDecodeError as e:
@@ -220,146 +216,114 @@ class MexcWebClient:
         logging.info(f"📤 Market Order: {result}")
         return result
 
-    def place_limit_order(self, symbol, side, price, quantity):
-        """Лімітний ордер для TP/SL"""
-        body_dict = {
-            "symbol": symbol,
-            "side": side,
-            "openType": 1,
-            "type": "1",
-            "price": str(price),
-            "vol": int(quantity),
-            "marketCeiling": False,
-            "priceProtect": "0"
-        }
-        
-        if os.getenv("DRY_RUN", "false").lower() == "true":
-            logging.info(f"🧪 DRY RUN: Limit {side} @ ${price}")
-            return {"success": True, "dry_run": True}
-        
-        url = "https://contract.mexc.com/api/v1/private/order/create"
-        result = self._make_signed_request(url, body_dict)
-        
-        logging.info(f"📤 Limit Order: {result}")
-        return result
-
     def place_plan_order(self, symbol, side, trigger_price, quantity, trigger_type="LE"):
         """
         План ордер (TP/SL)
-    
+        
         side: 2=Close Long, 4=Close Short
         trigger_type: 
             - "LE" (Less or Equal) для SL на long позиції
             - "GE" (Greater or Equal) для TP на long позиції
         """
-    body_dict = {
-        "symbol": symbol,
-        "side": side,
-        "openType": 1,
-        "type": "3",  # Plan order
-        "triggerPrice": str(trigger_price),
-        "triggerType": trigger_type,
-        "executeCycle": "1",  # GTC (Good Till Cancel)
-        "trend": "1",  # Trigger direction
-        "orderType": "5",  # Market order when triggered
-        "vol": int(quantity)
-    }
-    
-    if os.getenv("DRY_RUN", "false").lower() == "true":
-        logging.info(f"🧪 DRY RUN: Plan {side} trigger @ ${trigger_price}")
-        return {"success": True, "dry_run": True}
-    
-    url = "https://contract.mexc.com/api/v1/private/planorder/place"
-    result = self._make_signed_request(url, body_dict)
-    
-    logging.info(f"📤 Plan Order: {result}")
-    return result
-
-def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
-    """
-    Виставлення TP і SL після відкриття позиції
-    ВИКОРИСТОВУЄМО PLAN ORDERS
-    """
-    results = {"tp": None, "sl": None}
-    
-    # Для LONG: Close = Sell (side=2), для SHORT: Close = Buy (side=4)
-    close_side = 2 if direction == "LONG" else 4
-    
-    try:
-        if direction == "LONG":
-            # LONG позиція:
-            # TP: ціна піде вгору (GE - Greater or Equal)
-            # SL: ціна піде вниз (LE - Less or Equal)
-            
-            tp_result = self.place_plan_order(
-                symbol=symbol,
-                side=close_side,
-                trigger_price=tp_price,
-                quantity=quantity,
-                trigger_type="GE"
-            )
-            results["tp"] = tp_result
-            
-            if tp_result.get("success"):
-                logging.info(f"✅ TP set @ ${tp_price}")
-            else:
-                logging.error(f"❌ TP failed: {tp_result}")
-            
-            time.sleep(0.5)
-            
-            sl_result = self.place_plan_order(
-                symbol=symbol,
-                side=close_side,
-                trigger_price=sl_price,
-                quantity=quantity,
-                trigger_type="LE"
-            )
-            results["sl"] = sl_result
-            
-            if sl_result.get("success"):
-                logging.info(f"✅ SL set @ ${sl_price}")
-            else:
-                logging.error(f"❌ SL failed: {sl_result}")
+        body_dict = {
+            "symbol": symbol,
+            "side": side,
+            "openType": 1,
+            "type": "3",
+            "triggerPrice": str(trigger_price),
+            "triggerType": trigger_type,
+            "executeCycle": "1",
+            "trend": "1",
+            "orderType": "5",
+            "vol": int(quantity)
+        }
         
-        else:  # SHORT
-            # SHORT позиція:
-            # TP: ціна піде вниз (LE - Less or Equal)
-            # SL: ціна піде вгору (GE - Greater or Equal)
+        if os.getenv("DRY_RUN", "false").lower() == "true":
+            logging.info(f"🧪 DRY RUN: Plan {side} trigger @ ${trigger_price}")
+            return {"success": True, "dry_run": True}
+        
+        url = "https://contract.mexc.com/api/v1/private/planorder/place"
+        result = self._make_signed_request(url, body_dict)
+        
+        logging.info(f"📤 Plan Order: {result}")
+        return result
+
+    def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
+        """
+        Виставлення TP і SL після відкриття позиції
+        ВИКОРИСТОВУЄМО PLAN ORDERS
+        """
+        results = {"tp": None, "sl": None}
+        
+        close_side = 2 if direction == "LONG" else 4
+        
+        try:
+            if direction == "LONG":
+                tp_result = self.place_plan_order(
+                    symbol=symbol,
+                    side=close_side,
+                    trigger_price=tp_price,
+                    quantity=quantity,
+                    trigger_type="GE"
+                )
+                results["tp"] = tp_result
+                
+                if tp_result.get("success"):
+                    logging.info(f"✅ TP set @ ${tp_price}")
+                else:
+                    logging.error(f"❌ TP failed: {tp_result}")
+                
+                time.sleep(0.5)
+                
+                sl_result = self.place_plan_order(
+                    symbol=symbol,
+                    side=close_side,
+                    trigger_price=sl_price,
+                    quantity=quantity,
+                    trigger_type="LE"
+                )
+                results["sl"] = sl_result
+                
+                if sl_result.get("success"):
+                    logging.info(f"✅ SL set @ ${sl_price}")
+                else:
+                    logging.error(f"❌ SL failed: {sl_result}")
             
-            tp_result = self.place_plan_order(
-                symbol=symbol,
-                side=close_side,
-                trigger_price=tp_price,
-                quantity=quantity,
-                trigger_type="LE"
-            )
-            results["tp"] = tp_result
-            
-            if tp_result.get("success"):
-                logging.info(f"✅ TP set @ ${tp_price}")
             else:
-                logging.error(f"❌ TP failed: {tp_result}")
-            
-            time.sleep(0.5)
-            
-            sl_result = self.place_plan_order(
-                symbol=symbol,
-                side=close_side,
-                trigger_price=sl_price,
-                quantity=quantity,
-                trigger_type="GE"
-            )
-            results["sl"] = sl_result
-            
-            if sl_result.get("success"):
-                logging.info(f"✅ SL set @ ${sl_price}")
-            else:
-                logging.error(f"❌ SL failed: {sl_result}")
-            
-    except Exception as e:
-        logging.error(f"❌ SL/TP Exception: {e}")
-    
-    return results
+                tp_result = self.place_plan_order(
+                    symbol=symbol,
+                    side=close_side,
+                    trigger_price=tp_price,
+                    quantity=quantity,
+                    trigger_type="LE"
+                )
+                results["tp"] = tp_result
+                
+                if tp_result.get("success"):
+                    logging.info(f"✅ TP set @ ${tp_price}")
+                else:
+                    logging.error(f"❌ TP failed: {tp_result}")
+                
+                time.sleep(0.5)
+                
+                sl_result = self.place_plan_order(
+                    symbol=symbol,
+                    side=close_side,
+                    trigger_price=sl_price,
+                    quantity=quantity,
+                    trigger_type="GE"
+                )
+                results["sl"] = sl_result
+                
+                if sl_result.get("success"):
+                    logging.info(f"✅ SL set @ ${sl_price}")
+                else:
+                    logging.error(f"❌ SL failed: {sl_result}")
+                
+        except Exception as e:
+            logging.error(f"❌ SL/TP Exception: {e}")
+        
+        return results
 
 # ==========================================
 # 🎯 STATE MACHINE
