@@ -523,7 +523,7 @@ def main():
     global mexc_web, mexc_api, position_manager
     
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    web_token = os.getenv("MEXC_WEB_TOKEN", "").strip()  # mexc_logout_modal_token
+    web_token = os.getenv("MEXC_TOKEN", "").strip()  # ✅ ВИПРАВЛЕНО
     api_key = os.getenv("MEXC_API_KEY", "").strip()
     api_secret = os.getenv("MEXC_API_SECRET", "").strip()
     
