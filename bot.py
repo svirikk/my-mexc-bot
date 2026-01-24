@@ -136,28 +136,30 @@ class MexcWebClient:
             return {"success": False, "error": str(e)}
 
     def get_balance(self):
-        """Баланс через Web API"""
+        """Баланс ТІЛЬКИ Futures USDT"""
         try:
             url = "https://contract.mexc.com/api/v1/private/account/assets"
             result = self._make_signed_request(url, {}, method="GET")
-            
-            logging.info(f"📊 Full Balance Response: {json.dumps(result, indent=2)}")
             
             if not result.get("success"):
                 logging.warning(f"⚠️ Balance API: {result}")
                 return 0.0
 
             data = result.get("data", [])
+            
+            # ✅ ТІЛЬКИ USDT Futures
             if isinstance(data, list):
                 for item in data:
                     if item.get("currency") == "USDT":
                         bal = float(item.get("availableBalance", 0))
-                        logging.info(f"💰 Web Balance: {bal} USDT")
+                        logging.info(f"💰 Futures Balance: {bal} USDT")
                         return bal
             
+            logging.warning("⚠️ USDT not found in response")
             return 0.0
+            
         except Exception as e:
-            logging.error(f"❌ Balance error: {e}", exc_info=True)
+            logging.error(f"❌ Balance error: {e}")
             return 0.0
 
     def get_open_positions(self):
@@ -391,16 +393,33 @@ def calculate_risk_params(balance, price, direction):
         return None
 
 # ==========================================
-# 🔄 MONITORING LOOP
+# 🔄 OPTIMIZED MONITORING LOOP
 # ==========================================
 async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionManager, context):
-    logging.info("🔄 Monitoring started")
+    """
+    ✅ ОПТИМІЗОВАНИЙ моніторинг:
+    - Перевіряє ТІЛЬКИ коли є активні позиції
+    - Інтервал 10 секунд (не 5)
+    - Немає зайвих запитів балансу
+    """
+    logging.info("🔄 Monitoring started (optimized mode)")
+    
+    check_interval = 10  # секунд
+    last_balance_check = 0
+    balance_check_cooldown = 300  # баланс раз на 5 хвилин
     
     while True:
         try:
+            # ✅ Перевіряємо позиції ТІЛЬКИ якщо є активні
+            if len(manager.positions) == 0:
+                await asyncio.sleep(check_interval)
+                continue
+            
+            # Отримуємо позиції з біржі
             exchange_positions = web_client.get_open_positions()
             manager.update_from_exchange(exchange_positions)
             
+            # Обробка позицій що потребують TP/SL
             for symbol, managed in list(manager.positions.items()):
                 
                 if managed.state == PositionState.POSITION_DETECTED and not managed.sl_order_placed:
@@ -417,25 +436,36 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                     
                     manager.mark_sl_tp_placed(symbol)
                     
+                    # Сповіщення
                     target_id = os.getenv("SIGNAL_CHANNEL_ID")
+                    tp_change = ((managed.target_tp / managed.entry_price - 1) * 100) if managed.signal_direction == "LONG" else ((1 - managed.target_tp / managed.entry_price) * 100)
+                    sl_change = ((1 - managed.target_sl / managed.entry_price) * 100) if managed.signal_direction == "LONG" else ((managed.target_sl / managed.entry_price - 1) * 100)
+                    
                     msg = (
                         f"✅ <b>POSITION CONFIRMED</b>\n\n"
                         f"<b>Symbol:</b> {symbol}\n"
                         f"<b>Side:</b> {managed.signal_direction}\n"
                         f"<b>Entry:</b> ${managed.entry_price:.4f}\n"
                         f"<b>Size:</b> {managed.current_size}\n\n"
-                        f"🎯 <b>TP:</b> ${managed.target_tp:.4f} (+{((managed.target_tp/managed.entry_price-1)*100):.2f}%)\n"
-                        f"🛑 <b>SL:</b> ${managed.target_sl:.4f} (-{((1-managed.target_sl/managed.entry_price)*100):.2f}%)\n\n"
+                        f"🎯 <b>TP:</b> ${managed.target_tp:.4f} (+{tp_change:.2f}%)\n"
+                        f"🛑 <b>SL:</b> ${managed.target_sl:.4f} (-{sl_change:.2f}%)\n\n"
                         f"TP Status: {'✅' if result['tp'].get('success') else '❌'}\n"
                         f"SL Status: {'✅' if result['sl'].get('success') else '❌'}"
                     )
                     await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
             
-            await asyncio.sleep(5)
+            # ✅ Баланс перевіряємо рідко (раз на 5 хв)
+            current_time = time.time()
+            if current_time - last_balance_check > balance_check_cooldown:
+                balance = web_client.get_balance()
+                logging.info(f"💰 Periodic balance check: {balance} USDT")
+                last_balance_check = current_time
+            
+            await asyncio.sleep(check_interval)
             
         except Exception as e:
             logging.error(f"❌ Monitoring error: {e}", exc_info=True)
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)  # При помилці чекаємо довше
 
 # ==========================================
 # 🤖 TELEGRAM HANDLER
@@ -484,11 +514,17 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             logging.info(f"⏭️ {symbol_api} already managed")
             return
 
+        # ✅ Перевіряємо баланс ТІЛЬКИ при новому сигналі
         balance = mexc_web.get_balance()
-        logging.info(f"💰 Balance: {balance} USDT")
+        logging.info(f"💰 Balance for trade: {balance} USDT")
         
         if balance < 5:
             logging.error("❌ Balance too low")
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"❌ <b>Insufficient balance</b>\nCurrent: {balance} USDT\nMinimum: 5 USDT",
+                parse_mode="HTML"
+            )
             return
 
         risk = calculate_risk_params(balance, price, my_direction)
