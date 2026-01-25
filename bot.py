@@ -251,13 +251,31 @@ class MexcWebClient:
     def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
         """
         Виставлення TP і SL після відкриття позиції
-        ВИКОРИСТОВУЄМО PLAN ORDERS
+        ✅ З ЗАТРИМКОЮ для синхронізації з біржею
         """
         results = {"tp": None, "sl": None}
         
         close_side = 2 if direction == "LONG" else 4
         
         try:
+            # ✅ КРИТИЧНО: Чекаємо поки позиція з'явиться на біржі
+            logging.info(f"⏳ Waiting 3 seconds for position {symbol} to settle...")
+            time.sleep(3)
+            
+            # Перевіряємо що позиція існує
+            positions = self.get_open_positions()
+            pos_exists = any(p.get("symbol") == symbol and abs(float(p.get("holdVol", 0))) > 0 for p in positions)
+            
+            if not pos_exists:
+                logging.error(f"❌ Position {symbol} not found on exchange after 3 sec wait")
+                return {
+                    "tp": {"success": False, "error": "Position not found"},
+                    "sl": {"success": False, "error": "Position not found"}
+                }
+            
+            logging.info(f"✅ Position {symbol} confirmed on exchange, setting TP/SL...")
+            
+            # Тепер ставимо TP/SL
             if direction == "LONG":
                 tp_result = self.place_plan_order(
                     symbol=symbol,
@@ -289,7 +307,7 @@ class MexcWebClient:
                 else:
                     logging.error(f"❌ SL failed: {sl_result}")
             
-            else:
+            else:  # SHORT
                 tp_result = self.place_plan_order(
                     symbol=symbol,
                     side=close_side,
@@ -474,6 +492,7 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                 if managed.state == PositionState.POSITION_DETECTED and not managed.sl_order_placed:
                     logging.info(f"🎯 Setting SL/TP for {symbol}")
                     
+                    # ✅ СИНХРОННА затримка вже в set_sl_tp_for_position
                     result = web_client.set_sl_tp_for_position(
                         symbol=symbol,
                         direction=managed.signal_direction,
