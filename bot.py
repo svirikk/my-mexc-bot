@@ -226,30 +226,22 @@ class MexcWebClient:
 
     def place_plan_order(self, symbol, side, trigger_price, quantity, position_id=None, order_type="tp"):
         """
-        TP/SL ордер через stoporder/place endpoint (згідно офіційної документації MEXC)
-        
-        Args:
-            symbol: Символ (наприклад "BTC_USDT")
-            side: 2=Close Long, 4=Close Short
-            trigger_price: Ціна тригера
-            quantity: Кількість (float або int, перевіряється автоматично)
-            position_id: ID позиції (опціонально, але рекомендується)
-            order_type: "tp" або "sl" (для логування)
-        
-        Returns:
-            Dict з результатом API
+        TP/SL ордер через stoporder/place endpoint
         """
         # ✅ ВАЖЛИВО: Перевіряємо чи quantity має бути int
         if isinstance(quantity, float) and quantity.is_integer():
             quantity = int(quantity)
             logging.info(f"📊 [{order_type.upper()}] Rounded quantity to int: {quantity}")
         
-        # ✅ Базовий payload згідно документації MEXC для stoporder/place
+        # ✅ Базовий payload
+        # Щоб уникнути помилки 5003, відправляємо тільки те, що треба.
+        # Якщо відправляємо 0 як ціну, деякі ендпойнти можуть це не прийняти,
+        # але для MEXC зазвичай важливо, щоб АКТИВНА ціна була валідною (не нуль).
         body_dict = {
             "symbol": symbol,
             "side": side,
             "openType": 1,  # Isolated margin
-            "vol": quantity,  # ✅ Дозволяємо float якщо біржа підтримує
+            "vol": quantity,
             "stopLossPrice": trigger_price if order_type == "sl" else 0,
             "takeProfitPrice": trigger_price if order_type == "tp" else 0,
         }
@@ -268,9 +260,7 @@ class MexcWebClient:
             logging.info(f"🧪 DRY RUN: {order_type.upper()} @ ${trigger_price}")
             return {"success": True, "dry_run": True}
         
-        # ✅ ПРАВИЛЬНИЙ ENDPOINT згідно документації MEXC
         url = "https://contract.mexc.com/api/v1/private/stoporder/place"
-        
         result = self._make_signed_request(url, body_dict)
         
         logging.info(f"📥 [{order_type.upper()}] Response: {result}")
@@ -279,15 +269,8 @@ class MexcWebClient:
     def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
         """
         Виставлення TP і SL після відкриття позиції
-        
-        ✅ ВИПРАВЛЕНА ВЕРСІЯ:
-        1. Чекаємо поки позиція з'явиться на біржі
-        2. Знаходимо позицію по symbol і holdVol > 0
-        3. Отримуємо positionId
-        4. Ставимо TP/SL через stoporder/place endpoint
         """
         results = {"tp": None, "sl": None}
-        
         close_side = 2 if direction == "LONG" else 4
         
         try:
@@ -323,7 +306,6 @@ class MexcWebClient:
             
             if not target_position:
                 logging.error(f"❌ Position {symbol} not found on exchange after 3 sec wait")
-                logging.error(f"❌ Available positions: {[p.get('symbol') for p in positions]}")
                 return {
                     "tp": {"success": False, "error": "Position not found"},
                     "sl": {"success": False, "error": "Position not found"}
@@ -336,7 +318,7 @@ class MexcWebClient:
             logging.info(f"✅ Position confirmed: ID={position_id}, Vol={actual_volume}")
             logging.info(f"🎯 Setting TP/SL with positionId={position_id}...")
             
-            # ✅ КРОК 5: Ставимо TP через stoporder/place
+            # ✅ КРОК 5: Ставимо TP
             logging.info(f"🎯 Setting TP @ ${tp_price}")
             tp_result = self.place_plan_order(
                 symbol=symbol,
@@ -355,7 +337,7 @@ class MexcWebClient:
             
             time.sleep(0.5)
             
-            # ✅ КРОК 6: Ставимо SL через stoporder/place
+            # ✅ КРОК 6: Ставимо SL
             logging.info(f"🛑 Setting SL @ ${sl_price}")
             sl_result = self.place_plan_order(
                 symbol=symbol,
@@ -482,6 +464,8 @@ def calculate_risk_params(balance, price, direction):
         if qty < 1:
             qty = 1
         
+        # Це розрахунок для логування та "приблизний" розрахунок.
+        # Реальний TP/SL буде перераховано при відкритті позиції.
         if direction == "LONG":
             sl_price = round(price * (1 - sl_pct / 100), 4)
             tp_price = round(price * (1 + tp_pct / 100), 4)
@@ -526,7 +510,44 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                 if managed.state == PositionState.POSITION_DETECTED and not managed.sl_order_placed:
                     logging.info(f"🎯 Setting SL/TP for {symbol}")
                     
-                    # ✅ Викликаємо виправлену функцію
+                    # ==========================================================
+                    # 🔥 FIX: RECALCULATE TP/SL BASED ON ACTUAL ENTRY PRICE 🔥
+                    # ==========================================================
+                    try:
+                        entry = float(managed.entry_price)
+                        sl_pct_val = float(os.getenv("STOP_LOSS_PERCENT", 0.5)) / 100
+                        tp_pct_val = float(os.getenv("TAKE_PROFIT_PERCENT", 0.5)) / 100
+                        
+                        # Helper to determine precision (number of decimals)
+                        def get_precision(price_float):
+                            s = f"{price_float:.10f}".rstrip('0')
+                            if '.' in s:
+                                return len(s.split('.')[1])
+                            return 4 # Default fallback
+                            
+                        prec = get_precision(entry)
+                        
+                        # Recalculate logic
+                        if managed.signal_direction == "LONG":
+                            new_tp = entry * (1 + tp_pct_val)
+                            new_sl = entry * (1 - sl_pct_val)
+                        else: # SHORT
+                            # Short TP must be LOWER than entry
+                            # Short SL must be HIGHER than entry
+                            new_tp = entry * (1 - tp_pct_val)
+                            new_sl = entry * (1 + sl_pct_val)
+                            
+                        # Update managed targets with correct precision
+                        managed.target_tp = round(new_tp, prec)
+                        managed.target_sl = round(new_sl, prec)
+                        
+                        logging.info(f"🔄 Recalculated TP/SL from Entry {entry}: TP={managed.target_tp}, SL={managed.target_sl}")
+                        
+                    except Exception as calc_err:
+                        logging.error(f"❌ Error recalculating TP/SL: {calc_err}")
+
+                    # ==========================================================
+                    
                     result = web_client.set_sl_tp_for_position(
                         symbol=symbol,
                         direction=managed.signal_direction,
@@ -539,20 +560,33 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                     manager.mark_sl_tp_placed(symbol)
                     
                     target_id = os.getenv("SIGNAL_CHANNEL_ID")
-                    tp_change = ((managed.target_tp / managed.entry_price - 1) * 100) if managed.signal_direction == "LONG" else ((1 - managed.target_tp / managed.entry_price) * 100)
-                    sl_change = ((1 - managed.target_sl / managed.entry_price) * 100) if managed.signal_direction == "LONG" else ((managed.target_sl / managed.entry_price - 1) * 100)
+                    
+                    # Calculate realized change percentage for display
+                    if managed.entry_price > 0:
+                        tp_change = ((managed.target_tp / managed.entry_price - 1) * 100) if managed.signal_direction == "LONG" else ((1 - managed.target_tp / managed.entry_price) * 100)
+                        sl_change = ((1 - managed.target_sl / managed.entry_price) * 100) if managed.signal_direction == "LONG" else ((managed.target_sl / managed.entry_price - 1) * 100)
+                    else:
+                        tp_change = 0
+                        sl_change = 0
                     
                     msg = (
                         f"✅ <b>POSITION CONFIRMED</b>\n\n"
                         f"<b>Symbol:</b> {symbol}\n"
                         f"<b>Side:</b> {managed.signal_direction}\n"
-                        f"<b>Entry:</b> ${managed.entry_price:.4f}\n"
+                        f"<b>Entry:</b> ${managed.entry_price}\n"
                         f"<b>Size:</b> {managed.current_size}\n\n"
-                        f"🎯 <b>TP:</b> ${managed.target_tp:.4f} (+{tp_change:.2f}%)\n"
-                        f"🛑 <b>SL:</b> ${managed.target_sl:.4f} (-{sl_change:.2f}%)\n\n"
+                        f"🎯 <b>TP:</b> ${managed.target_tp} (+{tp_change:.2f}%)\n"
+                        f"🛑 <b>SL:</b> ${managed.target_sl} (-{sl_change:.2f}%)\n\n"
                         f"TP Status: {'✅' if result['tp'].get('success') else '❌'}\n"
                         f"SL Status: {'✅' if result['sl'].get('success') else '❌'}"
                     )
+                    
+                    # Check for errors to append to message
+                    if not result['tp'].get('success'):
+                         msg += f"\n⚠️ TP Error: {result['tp'].get('message') or result['tp'].get('msg')}"
+                    if not result['sl'].get('success'):
+                         msg += f"\n⚠️ SL Error: {result['sl'].get('message') or result['sl'].get('msg')}"
+
                     await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
             
             current_time = time.time()
