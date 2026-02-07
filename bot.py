@@ -125,6 +125,7 @@ class MexcWebClient:
             headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
             
             logging.info(f"🔗 Request: {method} {url}")
+            logging.debug(f"🔗 Payload: {body_dict}")
             
             if method == "GET":
                 resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
@@ -195,16 +196,23 @@ class MexcWebClient:
         """Відкриття позиції Market ордером"""
         side = 1 if direction == "LONG" else 3
         
+        # ✅ Перевіряємо чи quantity має бути int
+        if isinstance(quantity, float) and quantity.is_integer():
+            quantity = int(quantity)
+            logging.info(f"📊 Market order: rounded quantity to int: {quantity}")
+        
         body_dict = {
             "symbol": symbol,
             "side": side,
             "openType": 1,
             "type": "5",
-            "vol": int(quantity),
+            "vol": quantity,  # ✅ Не форсуємо int()
             "leverage": int(leverage),
             "marketCeiling": False,
             "priceProtect": "0"
         }
+        
+        logging.info(f"📤 Market Order Payload: {body_dict}")
         
         if os.getenv("DRY_RUN", "false").lower() == "true":
             logging.info(f"🧪 DRY RUN: {direction} {symbol} qty={quantity}")
@@ -213,133 +221,159 @@ class MexcWebClient:
         url = "https://contract.mexc.com/api/v1/private/order/create"
         result = self._make_signed_request(url, body_dict)
         
-        logging.info(f"📤 Market Order: {result}")
+        logging.info(f"📤 Market Order Result: {result}")
         return result
 
-    def place_plan_order(self, symbol, side, trigger_price, quantity, trigger_type="LE"):
+    def place_plan_order(self, symbol, side, trigger_price, quantity, position_id=None, order_type="tp"):
         """
-        План ордер (TP/SL)
+        TP/SL ордер через stoporder/place endpoint (згідно офіційної документації MEXC)
         
-        side: 2=Close Long, 4=Close Short
-        trigger_type: 
-            - "LE" (Less or Equal) для SL на long позиції
-            - "GE" (Greater or Equal) для TP на long позиції
+        Args:
+            symbol: Символ (наприклад "BTC_USDT")
+            side: 2=Close Long, 4=Close Short
+            trigger_price: Ціна тригера
+            quantity: Кількість (float або int, перевіряється автоматично)
+            position_id: ID позиції (опціонально, але рекомендується)
+            order_type: "tp" або "sl" (для логування)
+        
+        Returns:
+            Dict з результатом API
         """
+        # ✅ ВАЖЛИВО: Перевіряємо чи quantity має бути int
+        if isinstance(quantity, float) and quantity.is_integer():
+            quantity = int(quantity)
+            logging.info(f"📊 [{order_type.upper()}] Rounded quantity to int: {quantity}")
+        
+        # ✅ Базовий payload згідно документації MEXC для stoporder/place
         body_dict = {
             "symbol": symbol,
             "side": side,
-            "openType": 1,
-            "type": "3",
-            "triggerPrice": str(trigger_price),
-            "triggerType": trigger_type,
-            "executeCycle": "1",
-            "trend": "1",
-            "orderType": "5",
-            "vol": int(quantity)
+            "openType": 1,  # Isolated margin
+            "vol": quantity,  # ✅ Дозволяємо float якщо біржа підтримує
+            "stopLossPrice": trigger_price if order_type == "sl" else 0,
+            "takeProfitPrice": trigger_price if order_type == "tp" else 0,
         }
         
+        # Додаємо positionId якщо є
+        if position_id:
+            body_dict["positionId"] = position_id
+            logging.info(f"📌 Using positionId: {position_id}")
+        
+        logging.info(f"📤 [{order_type.upper()}] Setting {order_type.upper()} order")
+        logging.info(f"📤 Endpoint: https://contract.mexc.com/api/v1/private/stoporder/place")
+        logging.info(f"📤 Symbol: {symbol}, Side: {side}, Trigger: ${trigger_price}, Vol: {quantity}")
+        logging.info(f"📤 Full Payload: {body_dict}")
+        
         if os.getenv("DRY_RUN", "false").lower() == "true":
-            logging.info(f"🧪 DRY RUN: Plan {side} trigger @ ${trigger_price}")
+            logging.info(f"🧪 DRY RUN: {order_type.upper()} @ ${trigger_price}")
             return {"success": True, "dry_run": True}
         
-        url = "https://contract.mexc.com/api/v1/private/planorder/place"
+        # ✅ ПРАВИЛЬНИЙ ENDPOINT згідно документації MEXC
+        url = "https://contract.mexc.com/api/v1/private/stoporder/place"
+        
         result = self._make_signed_request(url, body_dict)
         
-        logging.info(f"📤 Plan Order: {result}")
+        logging.info(f"📥 [{order_type.upper()}] Response: {result}")
         return result
 
     def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
         """
         Виставлення TP і SL після відкриття позиції
-        ✅ З ЗАТРИМКОЮ для синхронізації з біржею
+        
+        ✅ ВИПРАВЛЕНА ВЕРСІЯ:
+        1. Чекаємо поки позиція з'явиться на біржі
+        2. Знаходимо позицію по symbol і holdVol > 0
+        3. Отримуємо positionId
+        4. Ставимо TP/SL через stoporder/place endpoint
         """
         results = {"tp": None, "sl": None}
         
         close_side = 2 if direction == "LONG" else 4
         
         try:
-            # ✅ КРИТИЧНО: Чекаємо поки позиція з'явиться на біржі
+            # ✅ КРОК 1: Чекаємо поки позиція з'явиться на біржі
             logging.info(f"⏳ Waiting 3 seconds for position {symbol} to settle...")
             time.sleep(3)
             
-            # Перевіряємо що позиція існує
+            # ✅ КРОК 2: Отримуємо відкриті позиції
+            logging.info(f"🔍 Fetching open positions from exchange...")
             positions = self.get_open_positions()
-            pos_exists = any(p.get("symbol") == symbol and abs(float(p.get("holdVol", 0))) > 0 for p in positions)
             
-            if not pos_exists:
+            if not positions:
+                logging.error(f"❌ No positions found on exchange")
+                return {
+                    "tp": {"success": False, "error": "No positions found"},
+                    "sl": {"success": False, "error": "No positions found"}
+                }
+            
+            # ✅ КРОК 3: Знаходимо нашу позицію по symbol і holdVol > 0
+            target_position = None
+            for pos in positions:
+                pos_symbol = pos.get("symbol")
+                pos_vol = abs(float(pos.get("holdVol", 0)))
+                pos_type = pos.get("positionType")  # 1=long, 2=short
+                
+                # Перевіряємо: правильний символ, є об'єм, правильний тип
+                expected_type = 1 if direction == "LONG" else 2
+                
+                if pos_symbol == symbol and pos_vol > 0 and pos_type == expected_type:
+                    target_position = pos
+                    logging.info(f"✅ Position found: {symbol}, Vol: {pos_vol}, Type: {pos_type}, ID: {pos.get('positionId')}")
+                    break
+            
+            if not target_position:
                 logging.error(f"❌ Position {symbol} not found on exchange after 3 sec wait")
+                logging.error(f"❌ Available positions: {[p.get('symbol') for p in positions]}")
                 return {
                     "tp": {"success": False, "error": "Position not found"},
                     "sl": {"success": False, "error": "Position not found"}
                 }
             
-            logging.info(f"✅ Position {symbol} confirmed on exchange, setting TP/SL...")
+            # ✅ КРОК 4: Отримуємо positionId та актуальний об'єм
+            position_id = target_position.get("positionId")
+            actual_volume = abs(float(target_position.get("holdVol", quantity)))
             
-            # Тепер ставимо TP/SL
-            if direction == "LONG":
-                tp_result = self.place_plan_order(
-                    symbol=symbol,
-                    side=close_side,
-                    trigger_price=tp_price,
-                    quantity=quantity,
-                    trigger_type="GE"
-                )
-                results["tp"] = tp_result
-                
-                if tp_result.get("success"):
-                    logging.info(f"✅ TP set @ ${tp_price}")
-                else:
-                    logging.error(f"❌ TP failed: {tp_result}")
-                
-                time.sleep(0.5)
-                
-                sl_result = self.place_plan_order(
-                    symbol=symbol,
-                    side=close_side,
-                    trigger_price=sl_price,
-                    quantity=quantity,
-                    trigger_type="LE"
-                )
-                results["sl"] = sl_result
-                
-                if sl_result.get("success"):
-                    logging.info(f"✅ SL set @ ${sl_price}")
-                else:
-                    logging.error(f"❌ SL failed: {sl_result}")
+            logging.info(f"✅ Position confirmed: ID={position_id}, Vol={actual_volume}")
+            logging.info(f"🎯 Setting TP/SL with positionId={position_id}...")
             
-            else:  # SHORT
-                tp_result = self.place_plan_order(
-                    symbol=symbol,
-                    side=close_side,
-                    trigger_price=tp_price,
-                    quantity=quantity,
-                    trigger_type="LE"
-                )
-                results["tp"] = tp_result
-                
-                if tp_result.get("success"):
-                    logging.info(f"✅ TP set @ ${tp_price}")
-                else:
-                    logging.error(f"❌ TP failed: {tp_result}")
-                
-                time.sleep(0.5)
-                
-                sl_result = self.place_plan_order(
-                    symbol=symbol,
-                    side=close_side,
-                    trigger_price=sl_price,
-                    quantity=quantity,
-                    trigger_type="GE"
-                )
-                results["sl"] = sl_result
-                
-                if sl_result.get("success"):
-                    logging.info(f"✅ SL set @ ${sl_price}")
-                else:
-                    logging.error(f"❌ SL failed: {sl_result}")
+            # ✅ КРОК 5: Ставимо TP через stoporder/place
+            logging.info(f"🎯 Setting TP @ ${tp_price}")
+            tp_result = self.place_plan_order(
+                symbol=symbol,
+                side=close_side,
+                trigger_price=tp_price,
+                quantity=actual_volume,
+                position_id=position_id,
+                order_type="tp"
+            )
+            results["tp"] = tp_result
+            
+            if tp_result.get("success"):
+                logging.info(f"✅ TP successfully set @ ${tp_price}")
+            else:
+                logging.error(f"❌ TP failed: {tp_result}")
+            
+            time.sleep(0.5)
+            
+            # ✅ КРОК 6: Ставимо SL через stoporder/place
+            logging.info(f"🛑 Setting SL @ ${sl_price}")
+            sl_result = self.place_plan_order(
+                symbol=symbol,
+                side=close_side,
+                trigger_price=sl_price,
+                quantity=actual_volume,
+                position_id=position_id,
+                order_type="sl"
+            )
+            results["sl"] = sl_result
+            
+            if sl_result.get("success"):
+                logging.info(f"✅ SL successfully set @ ${sl_price}")
+            else:
+                logging.error(f"❌ SL failed: {sl_result}")
                 
         except Exception as e:
-            logging.error(f"❌ SL/TP Exception: {e}")
+            logging.error(f"❌ SL/TP Exception: {e}", exc_info=True)
         
         return results
 
@@ -492,7 +526,7 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                 if managed.state == PositionState.POSITION_DETECTED and not managed.sl_order_placed:
                     logging.info(f"🎯 Setting SL/TP for {symbol}")
                     
-                    # ✅ СИНХРОННА затримка вже в set_sl_tp_for_position
+                    # ✅ Викликаємо виправлену функцію
                     result = web_client.set_sl_tp_for_position(
                         symbol=symbol,
                         direction=managed.signal_direction,
