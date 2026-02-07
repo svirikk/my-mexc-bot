@@ -6,7 +6,6 @@ import hashlib
 import re
 import logging
 import asyncio
-import html  # ✅ Додано для безпечної відправки тексту в Telegram
 from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass
@@ -73,18 +72,12 @@ class MexcWebClient:
         self.crypto = MexcCrypto()
         self.session = requests.Session()
         self.config_obj = None
-        
-        # ✅ FIX 403: Додаємо заголовки, щоб виглядати як браузер
+        # ✅ ПОВЕРНУЛИ СТАРІ ЗАГОЛОВКИ (Ті, що працювали для відкриття)
         self.base_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             "Content-Type": "application/json",
-            "Accept": "application/json, text/plain, */*",
-            "Origin": "https://futures.mexc.com",
-            "Referer": "https://futures.mexc.com/",
             "mtoken": self.crypto.mtoken,
-            "authorization": self.token,
-            # Іноді потрібен хоча б пустий Cookie або u_id
-            "Cookie": f"u_id={self.crypto.mtoken}" 
+            "authorization": self.token
         }
         self.refresh_config()
 
@@ -133,7 +126,6 @@ class MexcWebClient:
             headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
             
             logging.info(f"🔗 Request: {method} {url}")
-            # logging.debug(f"🔗 Payload: {body_dict}")
             
             if method == "GET":
                 resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
@@ -142,9 +134,10 @@ class MexcWebClient:
             
             logging.info(f"📥 Response status: {resp.status_code}")
             
+            # Обробка 403, щоб знати напевно
             if resp.status_code == 403:
-                logging.error("❌ 403 Access Denied. WAF Blocked.")
-                return {"success": False, "error": f"Access Denied (403): {resp.text[:100]}"}
+                logging.error("❌ 403 Forbidden. WAF Blocked request.")
+                return {"success": False, "error": "403 Forbidden"}
 
             if not resp.text.strip():
                 logging.error("❌ Empty response from server")
@@ -153,57 +146,45 @@ class MexcWebClient:
             try:
                 return resp.json()
             except json.JSONDecodeError as e:
-                # ✅ Логуємо raw text, але повертаємо безпечну помилку
-                logging.error(f"❌ JSON decode error. Response was: {resp.text[:200]}")
-                return {"success": False, "error": f"Invalid JSON response (Status {resp.status_code})"}
+                logging.error(f"❌ JSON decode error: {e}")
+                return {"success": False, "error": f"Invalid JSON"}
             
         except Exception as e:
             logging.error(f"❌ Request error: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     def get_balance(self):
-        """Баланс ТІЛЬКИ Futures USDT"""
         try:
             url = "https://contract.mexc.com/api/v1/private/account/assets"
             result = self._make_signed_request(url, {}, method="GET")
             
             if not result.get("success"):
-                logging.warning(f"⚠️ Balance API: {result}")
                 return 0.0
 
             data = result.get("data", [])
-            
             if isinstance(data, list):
                 for item in data:
                     if item.get("currency") == "USDT":
                         bal = float(item.get("availableBalance", 0))
                         logging.info(f"💰 Futures Balance: {bal} USDT")
                         return bal
-            
-            logging.warning("⚠️ USDT not found in response")
             return 0.0
-            
         except Exception as e:
             logging.error(f"❌ Balance error: {e}")
             return 0.0
 
     def get_open_positions(self):
-        """Відкриті позиції через Web API"""
         try:
             url = "https://contract.mexc.com/api/v1/private/position/open_positions"
             result = self._make_signed_request(url, {}, method="GET")
-            
             if not result.get("success"):
                 return []
-            
             return result.get("data", [])
-            
         except Exception as e:
             logging.error(f"❌ Positions error: {e}")
             return []
 
     def place_market_order(self, symbol, direction, quantity, leverage):
-        """Відкриття позиції Market ордером"""
         side = 1 if direction == "LONG" else 3
         
         if isinstance(quantity, float) and quantity.is_integer():
@@ -230,7 +211,9 @@ class MexcWebClient:
         return result
 
     def place_plan_order(self, symbol, side, trigger_price, quantity, position_id=None, order_type="tp"):
-        """TP/SL ордер через stoporder/place endpoint"""
+        """
+        TP/SL ордер через stoporder/place endpoint
+        """
         if isinstance(quantity, float) and quantity.is_integer():
             quantity = int(quantity)
         
@@ -248,14 +231,16 @@ class MexcWebClient:
         
         logging.info(f"📤 [{order_type.upper()}] Setting {order_type.upper()} @ {trigger_price}")
         
+        # Використовуємо коректний ендпоінт для Web/App клієнта
         url = "https://contract.mexc.com/api/v1/private/stoporder/place"
         result = self._make_signed_request(url, body_dict)
+        logging.info(f"📥 [{order_type.upper()}] Response: {result}")
         return result
 
     def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
         """Виставлення TP і SL після відкриття позиції"""
         results = {"tp": None, "sl": None}
-        close_side = 2 if direction == "LONG" else 4
+        close_side = 2 if direction == "LONG" else 4 # 2=Close Long, 4=Close Short
         
         try:
             logging.info(f"⏳ Waiting 3 seconds for position {symbol} to settle...")
@@ -287,13 +272,13 @@ class MexcWebClient:
             
             logging.info(f"🎯 Setting TP/SL for ID={position_id}, Vol={actual_volume}")
             
-            # Setting TP
+            # --- Setting TP ---
             tp_result = self.place_plan_order(symbol, close_side, tp_price, actual_volume, position_id, "tp")
             results["tp"] = tp_result
             
             time.sleep(0.5)
             
-            # Setting SL
+            # --- Setting SL ---
             sl_result = self.place_plan_order(symbol, close_side, sl_price, actual_volume, position_id, "sl")
             results["sl"] = sl_result
                 
@@ -340,6 +325,7 @@ class PositionManager:
             target_sl=sl_price,
             target_tp=tp_price
         )
+        logging.info(f"📡 Signal: {symbol} {direction}")
     
     def update_from_exchange(self, exchange_positions: List[Dict]):
         exchange_symbols = {}
@@ -396,7 +382,8 @@ def calculate_risk_params(balance, price, direction):
         qty = int(position_value_usd / price)
         if qty < 1: qty = 1
         
-        # Placeholder calculation (will be recalculated on entry)
+        # Ці попередні значення лише для старту. 
+        # Реальні TP/SL будуть перераховані від ціни входу.
         if direction == "LONG":
             sl_price = price * (1 - sl_pct / 100)
             tp_price = price * (1 + tp_pct / 100)
@@ -428,12 +415,15 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                 if managed.state == PositionState.POSITION_DETECTED and not managed.sl_order_placed:
                     logging.info(f"🎯 Calculating actual TP/SL for {symbol}")
                     
-                    # ✅ FIX TP/SL CALCULATION
+                    # ==========================================================
+                    # 🔥 ВИПРАВЛЕННЯ ЛОГІКИ TP/SL 🔥
+                    # ==========================================================
                     try:
                         entry = float(managed.entry_price)
                         sl_pct_val = float(os.getenv("STOP_LOSS_PERCENT", 0.5)) / 100
                         tp_pct_val = float(os.getenv("TAKE_PROFIT_PERCENT", 0.5)) / 100
                         
+                        # Допоміжна функція для визначення точності (кількості знаків)
                         def get_precision(price_float):
                             s = f"{price_float:.10f}".rstrip('0')
                             return len(s.split('.')[1]) if '.' in s else 4
@@ -441,18 +431,24 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                         prec = get_precision(entry)
                         
                         if managed.signal_direction == "LONG":
+                            # Для Long: TP вище входу, SL нижче входу
                             new_tp = entry * (1 + tp_pct_val)
                             new_sl = entry * (1 - sl_pct_val)
                         else: # SHORT
+                            # Для Short: TP НИЖЧЕ входу, SL ВИЩЕ входу
                             new_tp = entry * (1 - tp_pct_val)
                             new_sl = entry * (1 + sl_pct_val)
                             
+                        # Округлюємо, щоб не було помилки 5003
                         managed.target_tp = round(new_tp, prec)
                         managed.target_sl = round(new_sl, prec)
+                        
+                        logging.info(f"📊 Recalculated: Entry={entry} -> TP={managed.target_tp}, SL={managed.target_sl}")
                         
                     except Exception as e:
                         logging.error(f"Calc error: {e}")
 
+                    # Відправляємо запит на біржу
                     result = web_client.set_sl_tp_for_position(
                         symbol=symbol,
                         direction=managed.signal_direction,
@@ -464,7 +460,7 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                     
                     manager.mark_sl_tp_placed(symbol)
                     
-                    # Send Report
+                    # Звіт в Телеграм
                     target_id = os.getenv("SIGNAL_CHANNEL_ID")
                     
                     tp_ok = result['tp'].get('success')
@@ -482,14 +478,6 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                         f"SL Status: {'✅' if sl_ok else '❌'}"
                     )
                     
-                    # Додаємо помилки якщо є, але безпечно
-                    if not tp_ok:
-                        err = html.escape(str(result['tp'].get('error') or result['tp'].get('msg') or 'Unknown'))
-                        msg += f"\n⚠️ TP Err: {err}"
-                    if not sl_ok:
-                        err = html.escape(str(result['sl'].get('error') or result['sl'].get('msg') or 'Unknown'))
-                        msg += f"\n⚠️ SL Err: {err}"
-
                     await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
             
             await asyncio.sleep(check_interval)
@@ -546,13 +534,13 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             if symbol_api in position_manager.positions:
                 del position_manager.positions[symbol_api]
             
-            # ✅ FIX: Escape HTML in error message to prevent Telegram crash
-            raw_error = str(res.get('msg') or res.get('error') or 'Unknown')
-            safe_error = html.escape(raw_error)
+            error_msg = res.get('msg') or res.get('error') or 'Unknown'
+            # Видаляємо HTML теги з помилки, щоб не ламати Телеграм
+            safe_error = str(error_msg).replace('<', '').replace('>', '')
             
             await context.bot.send_message(
                 chat_id=target_id,
-                text=f"❌ <b>ORDER FAILED</b>\n<pre>{safe_error}</pre>",
+                text=f"❌ <b>ORDER FAILED</b>\n{safe_error}",
                 parse_mode="HTML"
             )
 
