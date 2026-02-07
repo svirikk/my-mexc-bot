@@ -72,6 +72,7 @@ class MexcWebClient:
         self.crypto = MexcCrypto()
         self.session = requests.Session()
         self.config_obj = None
+        self.tick_cache = {}  # Кеш для tick sizes
         self.base_headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             "Content-Type": "application/json",
@@ -94,16 +95,25 @@ class MexcWebClient:
             logging.error(f"❌ Помилка Config: {e}")
 
     def _make_signed_request(self, url, body_dict, method="POST"):
-        """Універсальний підписаний запит"""
+        """Універсальний підписаний запит з динамічним hostname"""
         try:
             if not self.config_obj:
                 self.refresh_config()
             
+            # Визначаємо hostname з URL
+            if "www.mexc.com" in url:
+                hostname = "www.mexc.com"
+            elif "contract.mexc.com" in url:
+                hostname = "contract.mexc.com"
+            else:
+                hostname = "contract.mexc.com"  # fallback
+            
             ts = str(int(time.time() * 1000))
             mhash = hashlib.md5(self.crypto.mtoken.encode()).hexdigest()
             
+            # Шифруємо з правильним hostname
             p0, k0 = self.crypto.encrypt_request({
-                "hostname": "contract.mexc.com",
+                "hostname": hostname,
                 "mhash": mhash,
                 "mtoken": self.crypto.mtoken,
                 "platform_type": 3,
@@ -118,13 +128,22 @@ class MexcWebClient:
                 "mhash": mhash
             })
             
+            # Зберігаємо алгоритм підпису ТОЧНО
             body_json = json.dumps(body_dict, separators=(",", ":"))
             inner = hashlib.md5((self.token + ts).encode()).hexdigest()[7:]
             x_mxc_sign = hashlib.md5((ts + body_json + inner).encode()).hexdigest()
             
             headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
             
+            # Додаємо заголовки для www.mexc.com
+            if hostname == "www.mexc.com":
+                headers["Host"] = "www.mexc.com"
+                headers["Origin"] = "https://www.mexc.com"
+                headers["Referer"] = "https://www.mexc.com/"
+            
             logging.info(f"🔗 Запит: {method} {url}")
+            logging.info(f"🏠 Hostname для encryption: {hostname}")
+            logging.info(f"🔑 Auth fields: p0={len(p0)} chars, k0={len(k0)} chars, chash={bool(self.config_obj['chash'])}")
             
             if method == "GET":
                 resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
@@ -145,11 +164,148 @@ class MexcWebClient:
                 return resp.json()
             except json.JSONDecodeError as e:
                 logging.error(f"❌ Помилка JSON decode: {e}")
+                logging.error(f"Response text: {resp.text[:500]}")
                 return {"success": False, "error": f"Invalid JSON"}
             
         except Exception as e:
             logging.error(f"❌ Помилка запиту: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+    def get_tick_size(self, symbol):
+        """Отримує tick size для символу"""
+        if symbol in self.tick_cache:
+            return self.tick_cache[symbol]
+        
+        try:
+            # Спроба отримати через contract info
+            url = "https://contract.mexc.com/api/v1/contract/detail"
+            params = {"symbol": symbol}
+            resp = self.session.get(url, params=params, timeout=5)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success") and data.get("data"):
+                    tick = float(data["data"].get("priceUnit", 0.01))
+                    self.tick_cache[symbol] = tick
+                    logging.info(f"📐 Tick size для {symbol}: {tick}")
+                    return tick
+        except Exception as e:
+            logging.warning(f"Не вдалося отримати tick size для {symbol}: {e}")
+        
+        # Fallback на основі ціни
+        logging.warning(f"Використовую fallback tick size для {symbol}")
+        return 0.001  # Універсальний fallback
+
+    def round_to_tick(self, price, tick, mode="nearest"):
+        """
+        Округлює ціну до tick size
+        mode: 'up', 'down', 'nearest'
+        """
+        if tick <= 0:
+            tick = 0.001
+        
+        if mode == "up":
+            return round((price // tick + 1) * tick, 10)
+        elif mode == "down":
+            return round((price // tick) * tick, 10)
+        else:  # nearest
+            return round(round(price / tick) * tick, 10)
+
+    def calculate_tp_sl(self, entry_price, direction, tp_percent, sl_percent, tick):
+        """
+        Розраховує TP/SL з правильним округленням та валідацією
+        
+        Returns: (tp_price, sl_price)
+        """
+        logging.info(f"📊 Розрахунок TP/SL:")
+        logging.info(f"  Entry: {entry_price}, Direction: {direction}")
+        logging.info(f"  TP%: {tp_percent*100}%, SL%: {sl_percent*100}%")
+        logging.info(f"  Tick size: {tick}")
+        
+        # Розрахунок сирих значень
+        if direction == "LONG":
+            tp_raw = entry_price * (1 + tp_percent)
+            sl_raw = entry_price * (1 - sl_percent)
+            
+            # Округлення для LONG: обидва DOWN
+            tp_price = self.round_to_tick(tp_raw, tick, "down")
+            sl_price = self.round_to_tick(sl_raw, tick, "down")
+            
+        else:  # SHORT
+            tp_raw = entry_price * (1 - tp_percent)
+            sl_raw = entry_price * (1 + sl_percent)
+            
+            # Округлення для SHORT: обидва UP
+            tp_price = self.round_to_tick(tp_raw, tick, "up")
+            sl_price = self.round_to_tick(sl_raw, tick, "up")
+        
+        logging.info(f"  TP raw: {tp_raw} -> rounded: {tp_price}")
+        logging.info(f"  SL raw: {sl_raw} -> rounded: {sl_price}")
+        
+        # Валідація та корекція
+        if direction == "LONG":
+            # LONG: TP > entry, SL < entry
+            if tp_price <= entry_price:
+                tp_price = entry_price + tick
+                logging.warning(f"⚠️ TP скориговано: {tp_price}")
+            if sl_price >= entry_price:
+                sl_price = entry_price - tick
+                logging.warning(f"⚠️ SL скориговано: {sl_price}")
+        else:  # SHORT
+            # SHORT: TP < entry, SL > entry
+            if tp_price >= entry_price:
+                tp_price = entry_price - tick
+                logging.warning(f"⚠️ TP скориговано: {tp_price}")
+            if sl_price <= entry_price:
+                sl_price = entry_price + tick
+                logging.warning(f"⚠️ SL скориговано: {sl_price}")
+        
+        logging.info(f"✅ Фінальні значення: TP={tp_price}, SL={sl_price}")
+        
+        return tp_price, sl_price
+
+    def open_position_with_sl_tp(self, symbol, direction, quantity, leverage, tp_price, sl_price):
+        """
+        Відкриває позицію з TP/SL в одному запиті через UI endpoint
+        """
+        side = 1 if direction == "LONG" else 3  # 1=Open Long, 3=Open Short
+        
+        if isinstance(quantity, float) and quantity.is_integer():
+            quantity = int(quantity)
+        
+        # ТОЧНА структура з DevTools
+        body_dict = {
+            "symbol": symbol,
+            "side": side,
+            "openType": 1,
+            "type": "5",  # STRING, market order
+            "vol": quantity,
+            "positionMode": 2,  # З DevTools
+            "marketCeiling": False,
+            "leverage": int(leverage),
+            "takeProfitPrice": str(tp_price),  # STRING!
+            "stopLossPrice": str(sl_price),    # STRING!
+            "profitTrend": "1",  # STRING!
+            "lossTrend": "1",    # STRING!
+            "priceProtect": "0"  # STRING!
+        }
+        
+        logging.info(f"📤 Відкриття позиції з TP/SL:")
+        logging.info(f"  Symbol: {symbol}, Side: {side} ({direction})")
+        logging.info(f"  Quantity: {quantity}, Leverage: {leverage}")
+        logging.info(f"  TP: {tp_price} (string: '{body_dict['takeProfitPrice']}')")
+        logging.info(f"  SL: {sl_price} (string: '{body_dict['stopLossPrice']}')")
+        logging.info(f"  profitTrend: '{body_dict['profitTrend']}', lossTrend: '{body_dict['lossTrend']}'")
+        
+        if os.getenv("DRY_RUN", "false").lower() == "true":
+            logging.info("🧪 DRY RUN MODE - не відправляю запит")
+            return {"success": True, "dry_run": True}
+        
+        # ПРАВИЛЬНИЙ UI endpoint
+        url = "https://www.mexc.com/api/platform/futures/api/v1/private/order/create"
+        result = self._make_signed_request(url, body_dict)
+        
+        return result
 
     def get_balance(self):
         try:
@@ -183,156 +339,6 @@ class MexcWebClient:
             logging.error(f"❌ Помилка позицій: {e}")
             return []
 
-    def place_market_order(self, symbol, direction, quantity, leverage):
-        side = 1 if direction == "LONG" else 3
-        
-        if isinstance(quantity, float) and quantity.is_integer():
-            quantity = int(quantity)
-        
-        body_dict = {
-            "symbol": symbol,
-            "side": side,
-            "openType": 1,
-            "type": "5",
-            "vol": quantity,
-            "leverage": int(leverage),
-            "marketCeiling": False,
-            "priceProtect": "0"
-        }
-        
-        logging.info(f"📤 Market Order Payload: {body_dict}")
-        
-        if os.getenv("DRY_RUN", "false").lower() == "true":
-            return {"success": True, "dry_run": True}
-        
-        url = "https://contract.mexc.com/api/v1/private/order/create"
-        result = self._make_signed_request(url, body_dict)
-        return result
-
-    def place_plan_order(self, symbol, side, trigger_price, quantity, position_id, order_type="tp"):
-        """
-        TP/SL ордер через stoporder/place/v2 endpoint (з DevTools)
-        ОБОВ'ЯЗКОВО: positionId, volType, profitLossVolType та інші поля
-        """
-        if isinstance(quantity, float) and quantity.is_integer():
-            quantity = int(quantity)
-        
-        # Базова структура запиту як у DevTools
-        body_dict = {
-            "symbol": symbol,
-            "side": side,
-            "openType": 1,
-            "vol": quantity,
-            "positionId": position_id,  # ОБОВ'ЯЗКОВО!
-            "volType": 2,  # Обов'язкове поле з DevTools
-            "profitLossVolType": "SAME",  # Обов'язкове поле
-            "priceProtect": "0"  # Обов'язкове поле
-        }
-        
-        # Встановлюємо ціну та тренд залежно від типу ордера
-        if order_type == "tp":
-            body_dict["takeProfitPrice"] = trigger_price
-            body_dict["stopLossPrice"] = 0
-            body_dict["profitTrend"] = 1  # Для TP
-            body_dict["lossTrend"] = 0
-            body_dict["takeProfitReverse"] = 2  # З DevTools
-            body_dict["stopLossReverse"] = 2
-        else:  # SL
-            body_dict["stopLossPrice"] = trigger_price
-            body_dict["takeProfitPrice"] = 0
-            body_dict["profitTrend"] = 0
-            body_dict["lossTrend"] = 1  # Для SL
-            body_dict["takeProfitReverse"] = 2  # З DevTools
-            body_dict["stopLossReverse"] = 2
-        
-        logging.info(f"📤 [{order_type.upper()}] Встановлюю {order_type.upper()} @ {trigger_price} для positionId={position_id}")
-        logging.info(f"📋 Payload: {body_dict}")
-        
-        # Використовуємо ПРАВИЛЬНИЙ ендпоінт з DevTools
-        url = "https://contract.mexc.com/api/platform/futures/api/v1/private/stoporder/place/v2"
-        result = self._make_signed_request(url, body_dict)
-        
-        # Логуємо stopPlanOrderId якщо є
-        if result.get("success") and result.get("data"):
-            plan_id = result["data"].get("stopPlanOrderId")
-            logging.info(f"✅ [{order_type.upper()}] Створено stopPlanOrderId: {plan_id}")
-        else:
-            logging.error(f"❌ [{order_type.upper()}] Помилка: {result}")
-        
-        return result
-
-    def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
-        """Виставлення TP і SL після відкриття позиції"""
-        results = {"tp": None, "sl": None}
-        close_side = 2 if direction == "LONG" else 4  # 2=Close Long, 4=Close Short
-        
-        try:
-            logging.info(f"⏳ Чекаю 3 секунди для закріплення позиції {symbol}...")
-            time.sleep(3)
-            
-            # Отримуємо актуальні позиції з біржі
-            positions = self.get_open_positions()
-            
-            if not positions:
-                logging.error("❌ Немає відкритих позицій")
-                return {"tp": {"success": False, "error": "No positions"}, "sl": {"success": False, "error": "No positions"}}
-            
-            # Шукаємо нашу позицію
-            target_position = None
-            for pos in positions:
-                pos_symbol = pos.get("symbol")
-                pos_vol = abs(float(pos.get("holdVol", 0)))
-                pos_type = pos.get("positionType")  # 1=long, 2=short
-                
-                expected_type = 1 if direction == "LONG" else 2
-                
-                if pos_symbol == symbol and pos_vol > 0 and pos_type == expected_type:
-                    target_position = pos
-                    break
-            
-            if not target_position:
-                logging.error(f"❌ Позиція {symbol} не знайдена")
-                return {"tp": {"success": False, "error": "Position not found"}, "sl": {"success": False, "error": "Position not found"}}
-            
-            # Отримуємо ОБОВ'ЯЗКОВИЙ positionId
-            position_id = target_position.get("positionId")
-            actual_volume = abs(float(target_position.get("holdVol", quantity)))
-            
-            if not position_id:
-                logging.error(f"❌ positionId не знайдено в позиції")
-                return {"tp": {"success": False, "error": "No positionId"}, "sl": {"success": False, "error": "No positionId"}}
-            
-            logging.info(f"🎯 Встановлюю TP/SL для positionId={position_id}, Vol={actual_volume}")
-            
-            # --- Встановлення TP ---
-            tp_result = self.place_plan_order(
-                symbol=symbol,
-                side=close_side,
-                trigger_price=tp_price,
-                quantity=actual_volume,
-                position_id=position_id,
-                order_type="tp"
-            )
-            results["tp"] = tp_result
-            
-            time.sleep(0.5)
-            
-            # --- Встановлення SL ---
-            sl_result = self.place_plan_order(
-                symbol=symbol,
-                side=close_side,
-                trigger_price=sl_price,
-                quantity=actual_volume,
-                position_id=position_id,
-                order_type="sl"
-            )
-            results["sl"] = sl_result
-                
-        except Exception as e:
-            logging.error(f"❌ Виняток SL/TP: {e}", exc_info=True)
-        
-        return results
-
 # ==========================================
 # 🎯 STATE MACHINE
 # ==========================================
@@ -340,7 +346,6 @@ class PositionState(Enum):
     NO_POSITION = "no_position"
     OPENING = "opening"
     POSITION_DETECTED = "position_detected"
-    SL_TP_SET = "sl_tp_set"
 
 @dataclass
 class ManagedPosition:
@@ -351,13 +356,9 @@ class ManagedPosition:
     current_size: float = 0.0
     entry_price: float = 0.0
     position_side: int = 0
-    sl_order_placed: bool = False
-    tp_order_placed: bool = False
     last_check: float = 0.0
     target_sl: float = 0.0
     target_tp: float = 0.0
-    tp_plan_order_id: str = ""  # Зберігаємо stopPlanOrderId для TP
-    sl_plan_order_id: str = ""  # Зберігаємо stopPlanOrderId для SL
 
 class PositionManager:
     def __init__(self):
@@ -399,7 +400,7 @@ class PositionManager:
                 elif time.time() - managed.signal_time > self.opening_timeout:
                     logging.warning(f"⏱️ ТАЙМАУТ: {symbol}")
                     del self.positions[symbol]
-            elif managed.state in [PositionState.POSITION_DETECTED, PositionState.SL_TP_SET]:
+            elif managed.state == PositionState.POSITION_DETECTED:
                 if symbol in exchange_symbols:
                     ex_pos = exchange_symbols[symbol]
                     managed.current_size = ex_pos["size"]
@@ -409,14 +410,6 @@ class PositionManager:
     
     def can_accept_signal(self, symbol: str) -> bool:
         return symbol not in self.positions
-    
-    def mark_sl_tp_placed(self, symbol: str, tp_plan_id: str = "", sl_plan_id: str = ""):
-        if symbol in self.positions:
-            self.positions[symbol].sl_order_placed = True
-            self.positions[symbol].tp_order_placed = True
-            self.positions[symbol].state = PositionState.SL_TP_SET
-            self.positions[symbol].tp_plan_order_id = tp_plan_id
-            self.positions[symbol].sl_plan_order_id = sl_plan_id
 
 # ==========================================
 # 💰 RISK MANAGEMENT
@@ -432,15 +425,13 @@ def calculate_risk_params(balance, price, direction):
         qty = int(position_value_usd / price)
         if qty < 1: qty = 1
         
-        # Попередні значення (будуть перераховані від реальної ціни входу)
-        if direction == "LONG":
-            sl_price = price * (1 - sl_pct / 100)
-            tp_price = price * (1 + tp_pct / 100)
-        else:
-            sl_price = price * (1 + sl_pct / 100)
-            tp_price = price * (1 - tp_pct / 100)
-            
-        return {"qty": qty, "sl_price": sl_price, "tp_price": tp_price}
+        # Повертаємо лише кількість та відсотки
+        # TP/SL будуть розраховані від реальної ціни входу
+        return {
+            "qty": qty, 
+            "tp_percent": tp_pct / 100,  # 0.005 для 0.5%
+            "sl_percent": sl_pct / 100
+        }
     except:
         return None
 
@@ -460,64 +451,10 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
             exchange_positions = web_client.get_open_positions()
             manager.update_from_exchange(exchange_positions)
             
+            # Повідомлення про підтверджені позиції
             for symbol, managed in list(manager.positions.items()):
-                if managed.state == PositionState.POSITION_DETECTED and not managed.sl_order_placed:
-                    logging.info(f"🎯 Розраховую реальні TP/SL для {symbol}")
-                    
-                    # Перераховуємо TP/SL від реальної ціни входу
-                    try:
-                        entry = float(managed.entry_price)
-                        sl_pct_val = float(os.getenv("STOP_LOSS_PERCENT", 0.5)) / 100
-                        tp_pct_val = float(os.getenv("TAKE_PROFIT_PERCENT", 0.5)) / 100
-                        
-                        def get_precision(price_float):
-                            s = f"{price_float:.10f}".rstrip('0')
-                            return len(s.split('.')[1]) if '.' in s else 4
-                            
-                        prec = get_precision(entry)
-                        
-                        if managed.signal_direction == "LONG":
-                            # Для Long: TP вище входу, SL нижче входу
-                            new_tp = entry * (1 + tp_pct_val)
-                            new_sl = entry * (1 - sl_pct_val)
-                        else:  # SHORT
-                            # Для Short: TP НИЖЧЕ входу, SL ВИЩЕ входу
-                            new_tp = entry * (1 - tp_pct_val)
-                            new_sl = entry * (1 + sl_pct_val)
-                            
-                        managed.target_tp = round(new_tp, prec)
-                        managed.target_sl = round(new_sl, prec)
-                        
-                        logging.info(f"📊 Перераховано: Entry={entry} -> TP={managed.target_tp}, SL={managed.target_sl}")
-                        
-                    except Exception as e:
-                        logging.error(f"Помилка розрахунку: {e}")
-
-                    # Відправляємо запит на біржу
-                    result = web_client.set_sl_tp_for_position(
-                        symbol=symbol,
-                        direction=managed.signal_direction,
-                        quantity=int(managed.current_size),
-                        entry_price=managed.entry_price,
-                        sl_price=managed.target_sl,
-                        tp_price=managed.target_tp
-                    )
-                    
-                    # Зберігаємо stopPlanOrderId
-                    tp_plan_id = ""
-                    sl_plan_id = ""
-                    if result['tp'].get('success') and result['tp'].get('data'):
-                        tp_plan_id = result['tp']['data'].get('stopPlanOrderId', '')
-                    if result['sl'].get('success') and result['sl'].get('data'):
-                        sl_plan_id = result['sl']['data'].get('stopPlanOrderId', '')
-                    
-                    manager.mark_sl_tp_placed(symbol, tp_plan_id, sl_plan_id)
-                    
-                    # Звіт в Телеграм
+                if managed.state == PositionState.POSITION_DETECTED and managed.entry_price > 0:
                     target_id = os.getenv("SIGNAL_CHANNEL_ID")
-                    
-                    tp_ok = result['tp'].get('success')
-                    sl_ok = result['sl'].get('success')
                     
                     msg = (
                         f"✅ <b>ПОЗИЦІЯ ПІДТВЕРДЖЕНА</b>\n\n"
@@ -527,16 +464,13 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                         f"<b>Розмір:</b> {managed.current_size}\n\n"
                         f"🎯 <b>TP:</b> ${managed.target_tp}\n"
                         f"🛑 <b>SL:</b> ${managed.target_sl}\n\n"
-                        f"TP Статус: {'✅' if tp_ok else '❌'}\n"
-                        f"SL Статус: {'✅' if sl_ok else '❌'}"
+                        f"ℹ️ TP/SL встановлені при відкритті"
                     )
                     
-                    if tp_plan_id:
-                        msg += f"\n\n📋 TP Order ID: {tp_plan_id}"
-                    if sl_plan_id:
-                        msg += f"\n📋 SL Order ID: {sl_plan_id}"
-                    
                     await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
+                    
+                    # Видаляємо з менеджера після повідомлення
+                    del manager.positions[symbol]
             
             await asyncio.sleep(check_interval)
             
@@ -579,14 +513,41 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         risk = calculate_risk_params(balance, price, my_direction)
-        position_manager.add_signal(symbol_api, my_direction, risk['sl_price'], risk['tp_price'])
+        
+        # Отримуємо tick size
+        tick = mexc_web.get_tick_size(symbol_api)
+        
+        # Розраховуємо TP/SL від поточної ціни (як approximation)
+        tp_price, sl_price = mexc_web.calculate_tp_sl(
+            entry_price=price,
+            direction=my_direction,
+            tp_percent=risk['tp_percent'],
+            sl_percent=risk['sl_percent'],
+            tick=tick
+        )
+        
+        position_manager.add_signal(symbol_api, my_direction, sl_price, tp_price)
         
         logging.info(f"🚀 Відкриваю {my_direction} {symbol_api}, Кількість: {risk['qty']}")
 
-        res = mexc_web.place_market_order(symbol_api, my_direction, risk['qty'], int(os.getenv("LEVERAGE", 20)))
+        res = mexc_web.open_position_with_sl_tp(
+            symbol=symbol_api,
+            direction=my_direction,
+            quantity=risk['qty'],
+            leverage=int(os.getenv("LEVERAGE", 20)),
+            tp_price=tp_price,
+            sl_price=sl_price
+        )
         
         if res.get("success") or res.get("dry_run"):
-            msg = f"✅ <b>ОРДЕР ВІДПРАВЛЕНО</b>\n{symbol_api} {my_direction}\nОчікування підтвердження..."
+            msg = (
+                f"✅ <b>ОРДЕР ВІДПРАВЛЕНО</b>\n\n"
+                f"{symbol_api} {my_direction}\n"
+                f"Розмір: {risk['qty']}\n"
+                f"🎯 TP: ${tp_price}\n"
+                f"🛑 SL: ${sl_price}\n\n"
+                f"Очікування підтвердження..."
+            )
             await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
         else:
             if symbol_api in position_manager.positions:
@@ -607,7 +568,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def post_init(application):
     target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
     if target_id:
-        await application.bot.send_message(chat_id=target_id, text="🚀 <b>MEXC Bot Перезавантажено</b>", parse_mode='HTML')
+        await application.bot.send_message(chat_id=target_id, text="🚀 <b>MEXC Bot v2.0 Запущено</b>\n<i>TP/SL в одному запиті</i>", parse_mode='HTML')
 
 def main():
     global mexc_web, position_manager
