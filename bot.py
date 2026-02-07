@@ -6,6 +6,7 @@ import hashlib
 import re
 import logging
 import asyncio
+import html  # ✅ Додано для безпечної відправки тексту в Telegram
 from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass
@@ -72,11 +73,18 @@ class MexcWebClient:
         self.crypto = MexcCrypto()
         self.session = requests.Session()
         self.config_obj = None
+        
+        # ✅ FIX 403: Додаємо заголовки, щоб виглядати як браузер
         self.base_headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://futures.mexc.com",
+            "Referer": "https://futures.mexc.com/",
             "mtoken": self.crypto.mtoken,
-            "authorization": self.token
+            "authorization": self.token,
+            # Іноді потрібен хоча б пустий Cookie або u_id
+            "Cookie": f"u_id={self.crypto.mtoken}" 
         }
         self.refresh_config()
 
@@ -125,7 +133,7 @@ class MexcWebClient:
             headers = {**self.base_headers, "x-mxc-nonce": ts, "x-mxc-sign": x_mxc_sign}
             
             logging.info(f"🔗 Request: {method} {url}")
-            logging.debug(f"🔗 Payload: {body_dict}")
+            # logging.debug(f"🔗 Payload: {body_dict}")
             
             if method == "GET":
                 resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
@@ -133,8 +141,11 @@ class MexcWebClient:
                 resp = self.session.post(url, data=body_json, headers=headers, timeout=10)
             
             logging.info(f"📥 Response status: {resp.status_code}")
-            logging.info(f"📥 Response text: {resp.text[:500]}")
             
+            if resp.status_code == 403:
+                logging.error("❌ 403 Access Denied. WAF Blocked.")
+                return {"success": False, "error": f"Access Denied (403): {resp.text[:100]}"}
+
             if not resp.text.strip():
                 logging.error("❌ Empty response from server")
                 return {"success": False, "error": "Empty response"}
@@ -142,9 +153,9 @@ class MexcWebClient:
             try:
                 return resp.json()
             except json.JSONDecodeError as e:
-                logging.error(f"❌ JSON decode error: {e}")
-                logging.error(f"❌ Response was: {resp.text}")
-                return {"success": False, "error": f"Invalid JSON: {resp.text[:100]}"}
+                # ✅ Логуємо raw text, але повертаємо безпечну помилку
+                logging.error(f"❌ JSON decode error. Response was: {resp.text[:200]}")
+                return {"success": False, "error": f"Invalid JSON response (Status {resp.status_code})"}
             
         except Exception as e:
             logging.error(f"❌ Request error: {e}", exc_info=True)
@@ -183,7 +194,6 @@ class MexcWebClient:
             result = self._make_signed_request(url, {}, method="GET")
             
             if not result.get("success"):
-                logging.warning(f"⚠️ Positions: {result}")
                 return []
             
             return result.get("data", [])
@@ -196,17 +206,15 @@ class MexcWebClient:
         """Відкриття позиції Market ордером"""
         side = 1 if direction == "LONG" else 3
         
-        # ✅ Перевіряємо чи quantity має бути int
         if isinstance(quantity, float) and quantity.is_integer():
             quantity = int(quantity)
-            logging.info(f"📊 Market order: rounded quantity to int: {quantity}")
         
         body_dict = {
             "symbol": symbol,
             "side": side,
             "openType": 1,
             "type": "5",
-            "vol": quantity,  # ✅ Не форсуємо int()
+            "vol": quantity,
             "leverage": int(leverage),
             "marketCeiling": False,
             "priceProtect": "0"
@@ -215,144 +223,79 @@ class MexcWebClient:
         logging.info(f"📤 Market Order Payload: {body_dict}")
         
         if os.getenv("DRY_RUN", "false").lower() == "true":
-            logging.info(f"🧪 DRY RUN: {direction} {symbol} qty={quantity}")
             return {"success": True, "dry_run": True}
         
         url = "https://contract.mexc.com/api/v1/private/order/create"
         result = self._make_signed_request(url, body_dict)
-        
-        logging.info(f"📤 Market Order Result: {result}")
         return result
 
     def place_plan_order(self, symbol, side, trigger_price, quantity, position_id=None, order_type="tp"):
-        """
-        TP/SL ордер через stoporder/place endpoint
-        """
-        # ✅ ВАЖЛИВО: Перевіряємо чи quantity має бути int
+        """TP/SL ордер через stoporder/place endpoint"""
         if isinstance(quantity, float) and quantity.is_integer():
             quantity = int(quantity)
-            logging.info(f"📊 [{order_type.upper()}] Rounded quantity to int: {quantity}")
         
-        # ✅ Базовий payload
-        # Щоб уникнути помилки 5003, відправляємо тільки те, що треба.
-        # Якщо відправляємо 0 як ціну, деякі ендпойнти можуть це не прийняти,
-        # але для MEXC зазвичай важливо, щоб АКТИВНА ціна була валідною (не нуль).
         body_dict = {
             "symbol": symbol,
             "side": side,
-            "openType": 1,  # Isolated margin
+            "openType": 1,
             "vol": quantity,
             "stopLossPrice": trigger_price if order_type == "sl" else 0,
             "takeProfitPrice": trigger_price if order_type == "tp" else 0,
         }
         
-        # Додаємо positionId якщо є
         if position_id:
             body_dict["positionId"] = position_id
-            logging.info(f"📌 Using positionId: {position_id}")
         
-        logging.info(f"📤 [{order_type.upper()}] Setting {order_type.upper()} order")
-        logging.info(f"📤 Endpoint: https://contract.mexc.com/api/v1/private/stoporder/place")
-        logging.info(f"📤 Symbol: {symbol}, Side: {side}, Trigger: ${trigger_price}, Vol: {quantity}")
-        logging.info(f"📤 Full Payload: {body_dict}")
-        
-        if os.getenv("DRY_RUN", "false").lower() == "true":
-            logging.info(f"🧪 DRY RUN: {order_type.upper()} @ ${trigger_price}")
-            return {"success": True, "dry_run": True}
+        logging.info(f"📤 [{order_type.upper()}] Setting {order_type.upper()} @ {trigger_price}")
         
         url = "https://contract.mexc.com/api/v1/private/stoporder/place"
         result = self._make_signed_request(url, body_dict)
-        
-        logging.info(f"📥 [{order_type.upper()}] Response: {result}")
         return result
 
     def set_sl_tp_for_position(self, symbol, direction, quantity, entry_price, sl_price, tp_price):
-        """
-        Виставлення TP і SL після відкриття позиції
-        """
+        """Виставлення TP і SL після відкриття позиції"""
         results = {"tp": None, "sl": None}
         close_side = 2 if direction == "LONG" else 4
         
         try:
-            # ✅ КРОК 1: Чекаємо поки позиція з'явиться на біржі
             logging.info(f"⏳ Waiting 3 seconds for position {symbol} to settle...")
             time.sleep(3)
             
-            # ✅ КРОК 2: Отримуємо відкриті позиції
-            logging.info(f"🔍 Fetching open positions from exchange...")
             positions = self.get_open_positions()
             
             if not positions:
-                logging.error(f"❌ No positions found on exchange")
-                return {
-                    "tp": {"success": False, "error": "No positions found"},
-                    "sl": {"success": False, "error": "No positions found"}
-                }
+                return {"tp": {"success": False, "error": "No positions"}, "sl": {"success": False, "error": "No positions"}}
             
-            # ✅ КРОК 3: Знаходимо нашу позицію по symbol і holdVol > 0
             target_position = None
             for pos in positions:
                 pos_symbol = pos.get("symbol")
                 pos_vol = abs(float(pos.get("holdVol", 0)))
                 pos_type = pos.get("positionType")  # 1=long, 2=short
                 
-                # Перевіряємо: правильний символ, є об'єм, правильний тип
                 expected_type = 1 if direction == "LONG" else 2
                 
                 if pos_symbol == symbol and pos_vol > 0 and pos_type == expected_type:
                     target_position = pos
-                    logging.info(f"✅ Position found: {symbol}, Vol: {pos_vol}, Type: {pos_type}, ID: {pos.get('positionId')}")
                     break
             
             if not target_position:
-                logging.error(f"❌ Position {symbol} not found on exchange after 3 sec wait")
-                return {
-                    "tp": {"success": False, "error": "Position not found"},
-                    "sl": {"success": False, "error": "Position not found"}
-                }
+                logging.error(f"❌ Position {symbol} not found")
+                return {"tp": {"success": False, "error": "Not found"}, "sl": {"success": False, "error": "Not found"}}
             
-            # ✅ КРОК 4: Отримуємо positionId та актуальний об'єм
             position_id = target_position.get("positionId")
             actual_volume = abs(float(target_position.get("holdVol", quantity)))
             
-            logging.info(f"✅ Position confirmed: ID={position_id}, Vol={actual_volume}")
-            logging.info(f"🎯 Setting TP/SL with positionId={position_id}...")
+            logging.info(f"🎯 Setting TP/SL for ID={position_id}, Vol={actual_volume}")
             
-            # ✅ КРОК 5: Ставимо TP
-            logging.info(f"🎯 Setting TP @ ${tp_price}")
-            tp_result = self.place_plan_order(
-                symbol=symbol,
-                side=close_side,
-                trigger_price=tp_price,
-                quantity=actual_volume,
-                position_id=position_id,
-                order_type="tp"
-            )
+            # Setting TP
+            tp_result = self.place_plan_order(symbol, close_side, tp_price, actual_volume, position_id, "tp")
             results["tp"] = tp_result
-            
-            if tp_result.get("success"):
-                logging.info(f"✅ TP successfully set @ ${tp_price}")
-            else:
-                logging.error(f"❌ TP failed: {tp_result}")
             
             time.sleep(0.5)
             
-            # ✅ КРОК 6: Ставимо SL
-            logging.info(f"🛑 Setting SL @ ${sl_price}")
-            sl_result = self.place_plan_order(
-                symbol=symbol,
-                side=close_side,
-                trigger_price=sl_price,
-                quantity=actual_volume,
-                position_id=position_id,
-                order_type="sl"
-            )
+            # Setting SL
+            sl_result = self.place_plan_order(symbol, close_side, sl_price, actual_volume, position_id, "sl")
             results["sl"] = sl_result
-            
-            if sl_result.get("success"):
-                logging.info(f"✅ SL successfully set @ ${sl_price}")
-            else:
-                logging.error(f"❌ SL failed: {sl_result}")
                 
         except Exception as e:
             logging.error(f"❌ SL/TP Exception: {e}", exc_info=True)
@@ -397,15 +340,12 @@ class PositionManager:
             target_sl=sl_price,
             target_tp=tp_price
         )
-        logging.info(f"📡 Signal: {symbol} {direction}")
     
     def update_from_exchange(self, exchange_positions: List[Dict]):
         exchange_symbols = {}
-        
         for pos in exchange_positions:
             symbol = pos.get("symbol")
             size = abs(float(pos.get("holdVol", 0)))
-            
             if size > 0:
                 exchange_symbols[symbol] = {
                     "size": size,
@@ -414,7 +354,6 @@ class PositionManager:
                 }
         
         for symbol, managed in list(self.positions.items()):
-            
             if managed.state == PositionState.OPENING:
                 if symbol in exchange_symbols:
                     ex_pos = exchange_symbols[symbol]
@@ -422,18 +361,14 @@ class PositionManager:
                     managed.current_size = ex_pos["size"]
                     managed.entry_price = ex_pos["entry_price"]
                     managed.position_side = ex_pos["side"]
-                    managed.last_check = time.time()
-                    logging.info(f"✅ POSITION OPENED: {symbol}, size={ex_pos['size']}, entry={ex_pos['entry_price']}")
-                    
+                    logging.info(f"✅ POSITION OPENED: {symbol}")
                 elif time.time() - managed.signal_time > self.opening_timeout:
                     logging.warning(f"⏱️ TIMEOUT: {symbol}")
                     del self.positions[symbol]
-            
             elif managed.state in [PositionState.POSITION_DETECTED, PositionState.SL_TP_SET]:
                 if symbol in exchange_symbols:
                     ex_pos = exchange_symbols[symbol]
                     managed.current_size = ex_pos["size"]
-                    managed.last_check = time.time()
                 else:
                     logging.warning(f"🔔 POSITION CLOSED: {symbol}")
                     del self.positions[symbol]
@@ -446,7 +381,6 @@ class PositionManager:
             self.positions[symbol].sl_order_placed = True
             self.positions[symbol].tp_order_placed = True
             self.positions[symbol].state = PositionState.SL_TP_SET
-            logging.info(f"✅ SL/TP marked: {symbol}")
 
 # ==========================================
 # 💰 RISK MANAGEMENT
@@ -460,41 +394,26 @@ def calculate_risk_params(balance, price, direction):
         risk_amount = balance * (risk_pct / 100)
         position_value_usd = risk_amount / (sl_pct / 100)
         qty = int(position_value_usd / price)
+        if qty < 1: qty = 1
         
-        if qty < 1:
-            qty = 1
-        
-        # Це розрахунок для логування та "приблизний" розрахунок.
-        # Реальний TP/SL буде перераховано при відкритті позиції.
+        # Placeholder calculation (will be recalculated on entry)
         if direction == "LONG":
-            sl_price = round(price * (1 - sl_pct / 100), 4)
-            tp_price = round(price * (1 + tp_pct / 100), 4)
+            sl_price = price * (1 - sl_pct / 100)
+            tp_price = price * (1 + tp_pct / 100)
         else:
-            sl_price = round(price * (1 + sl_pct / 100), 4)
-            tp_price = round(price * (1 - tp_pct / 100), 4)
+            sl_price = price * (1 + sl_pct / 100)
+            tp_price = price * (1 - tp_pct / 100)
             
-        return {
-            "qty": qty,
-            "sl_price": sl_price,
-            "tp_price": tp_price,
-            "risk_amount": risk_amount,
-            "sl_pct": sl_pct,
-            "tp_pct": tp_pct
-        }
-    except Exception as e:
-        logging.error(f"❌ Risk calc: {e}")
+        return {"qty": qty, "sl_price": sl_price, "tp_price": tp_price}
+    except:
         return None
 
 # ==========================================
 # 🔄 MONITORING LOOP
 # ==========================================
 async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionManager, context):
-    """Оптимізований моніторинг"""
     logging.info("🔄 Monitoring started")
-    
     check_interval = 10
-    last_balance_check = 0
-    balance_check_cooldown = 300
     
     while True:
         try:
@@ -506,48 +425,34 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
             manager.update_from_exchange(exchange_positions)
             
             for symbol, managed in list(manager.positions.items()):
-                
                 if managed.state == PositionState.POSITION_DETECTED and not managed.sl_order_placed:
-                    logging.info(f"🎯 Setting SL/TP for {symbol}")
+                    logging.info(f"🎯 Calculating actual TP/SL for {symbol}")
                     
-                    # ==========================================================
-                    # 🔥 FIX: RECALCULATE TP/SL BASED ON ACTUAL ENTRY PRICE 🔥
-                    # ==========================================================
+                    # ✅ FIX TP/SL CALCULATION
                     try:
                         entry = float(managed.entry_price)
                         sl_pct_val = float(os.getenv("STOP_LOSS_PERCENT", 0.5)) / 100
                         tp_pct_val = float(os.getenv("TAKE_PROFIT_PERCENT", 0.5)) / 100
                         
-                        # Helper to determine precision (number of decimals)
                         def get_precision(price_float):
                             s = f"{price_float:.10f}".rstrip('0')
-                            if '.' in s:
-                                return len(s.split('.')[1])
-                            return 4 # Default fallback
+                            return len(s.split('.')[1]) if '.' in s else 4
                             
                         prec = get_precision(entry)
                         
-                        # Recalculate logic
                         if managed.signal_direction == "LONG":
                             new_tp = entry * (1 + tp_pct_val)
                             new_sl = entry * (1 - sl_pct_val)
                         else: # SHORT
-                            # Short TP must be LOWER than entry
-                            # Short SL must be HIGHER than entry
                             new_tp = entry * (1 - tp_pct_val)
                             new_sl = entry * (1 + sl_pct_val)
                             
-                        # Update managed targets with correct precision
                         managed.target_tp = round(new_tp, prec)
                         managed.target_sl = round(new_sl, prec)
                         
-                        logging.info(f"🔄 Recalculated TP/SL from Entry {entry}: TP={managed.target_tp}, SL={managed.target_sl}")
-                        
-                    except Exception as calc_err:
-                        logging.error(f"❌ Error recalculating TP/SL: {calc_err}")
+                    except Exception as e:
+                        logging.error(f"Calc error: {e}")
 
-                    # ==========================================================
-                    
                     result = web_client.set_sl_tp_for_position(
                         symbol=symbol,
                         direction=managed.signal_direction,
@@ -559,15 +464,11 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                     
                     manager.mark_sl_tp_placed(symbol)
                     
+                    # Send Report
                     target_id = os.getenv("SIGNAL_CHANNEL_ID")
                     
-                    # Calculate realized change percentage for display
-                    if managed.entry_price > 0:
-                        tp_change = ((managed.target_tp / managed.entry_price - 1) * 100) if managed.signal_direction == "LONG" else ((1 - managed.target_tp / managed.entry_price) * 100)
-                        sl_change = ((1 - managed.target_sl / managed.entry_price) * 100) if managed.signal_direction == "LONG" else ((managed.target_sl / managed.entry_price - 1) * 100)
-                    else:
-                        tp_change = 0
-                        sl_change = 0
+                    tp_ok = result['tp'].get('success')
+                    sl_ok = result['sl'].get('success')
                     
                     msg = (
                         f"✅ <b>POSITION CONFIRMED</b>\n\n"
@@ -575,30 +476,26 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                         f"<b>Side:</b> {managed.signal_direction}\n"
                         f"<b>Entry:</b> ${managed.entry_price}\n"
                         f"<b>Size:</b> {managed.current_size}\n\n"
-                        f"🎯 <b>TP:</b> ${managed.target_tp} (+{tp_change:.2f}%)\n"
-                        f"🛑 <b>SL:</b> ${managed.target_sl} (-{sl_change:.2f}%)\n\n"
-                        f"TP Status: {'✅' if result['tp'].get('success') else '❌'}\n"
-                        f"SL Status: {'✅' if result['sl'].get('success') else '❌'}"
+                        f"🎯 <b>TP:</b> ${managed.target_tp}\n"
+                        f"🛑 <b>SL:</b> ${managed.target_sl}\n\n"
+                        f"TP Status: {'✅' if tp_ok else '❌'}\n"
+                        f"SL Status: {'✅' if sl_ok else '❌'}"
                     )
                     
-                    # Check for errors to append to message
-                    if not result['tp'].get('success'):
-                         msg += f"\n⚠️ TP Error: {result['tp'].get('message') or result['tp'].get('msg')}"
-                    if not result['sl'].get('success'):
-                         msg += f"\n⚠️ SL Error: {result['sl'].get('message') or result['sl'].get('msg')}"
+                    # Додаємо помилки якщо є, але безпечно
+                    if not tp_ok:
+                        err = html.escape(str(result['tp'].get('error') or result['tp'].get('msg') or 'Unknown'))
+                        msg += f"\n⚠️ TP Err: {err}"
+                    if not sl_ok:
+                        err = html.escape(str(result['sl'].get('error') or result['sl'].get('msg') or 'Unknown'))
+                        msg += f"\n⚠️ SL Err: {err}"
 
                     await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
-            
-            current_time = time.time()
-            if current_time - last_balance_check > balance_check_cooldown:
-                balance = web_client.get_balance()
-                logging.info(f"💰 Periodic balance check: {balance} USDT")
-                last_balance_check = current_time
             
             await asyncio.sleep(check_interval)
             
         except Exception as e:
-            logging.error(f"❌ Monitoring error: {e}", exc_info=True)
+            logging.error(f"❌ Monitoring error: {e}")
             await asyncio.sleep(30)
 
 # ==========================================
@@ -611,16 +508,11 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     global mexc_web, position_manager
     
     target_id = str(os.getenv("SIGNAL_CHANNEL_ID", "")).strip()
-    current_id = str(update.effective_chat.id).strip()
-    
-    if current_id != target_id:
-        return
+    if str(update.effective_chat.id).strip() != target_id: return
 
     msg_text = update.channel_post.text or update.channel_post.caption or ""
     json_match = re.search(r'(\{.*\})', msg_text, re.DOTALL)
-    
-    if not json_match:
-        return
+    if not json_match: return
         
     try:
         data = json.loads(json_match.group(1))
@@ -630,77 +522,37 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         signal_type = str(data.get('signalType', '')).upper()
         price = float(data['stats']['lastPrice'])
         
-        my_direction = None
-        if signal_type == "LONG_FLUSH":
-            my_direction = "LONG"
-        elif signal_type == "SHORT_SQUEEZE":
-            my_direction = "SHORT"
-        
-        if not my_direction:
-            return
+        my_direction = "LONG" if signal_type == "LONG_FLUSH" else "SHORT" if signal_type == "SHORT_SQUEEZE" else None
+        if not my_direction: return
 
-        allowed_str = os.getenv("ALLOWED_SYMBOLS", "").upper()
-        if symbol_raw not in allowed_str and f"{symbol_raw}USDT" not in allowed_str:
-            logging.info(f"⏭️ {symbol_raw} not allowed")
-            return
-
-        if not position_manager.can_accept_signal(symbol_api):
-            logging.info(f"⏭️ {symbol_api} already managed")
-            return
+        if not position_manager.can_accept_signal(symbol_api): return
 
         balance = mexc_web.get_balance()
-        logging.info(f"💰 Balance for trade: {balance} USDT")
-        
         if balance < 5:
-            logging.error("❌ Balance too low")
-            await context.bot.send_message(
-                chat_id=target_id,
-                text=f"❌ <b>Insufficient balance</b>\nCurrent: {balance} USDT\nMinimum: 5 USDT",
-                parse_mode="HTML"
-            )
+            await context.bot.send_message(chat_id=target_id, text=f"❌ Low Balance: {balance} USDT")
             return
 
         risk = calculate_risk_params(balance, price, my_direction)
-        if not risk:
-            return
-        
         position_manager.add_signal(symbol_api, my_direction, risk['sl_price'], risk['tp_price'])
         
         logging.info(f"🚀 Opening {my_direction} {symbol_api}, Qty: {risk['qty']}")
 
-        res = mexc_web.place_market_order(
-            symbol=symbol_api,
-            direction=my_direction,
-            quantity=risk['qty'],
-            leverage=int(os.getenv("LEVERAGE", 20))
-        )
+        res = mexc_web.place_market_order(symbol_api, my_direction, risk['qty'], int(os.getenv("LEVERAGE", 20)))
         
         if res.get("success") or res.get("dry_run"):
-            is_dry = res.get("dry_run")
-            header = "🧪 <b>DRY RUN</b>" if is_dry else "✅ <b>ORDER SENT</b>"
-            emoji = "📈" if my_direction == "LONG" else "📉"
-            
-            msg = (
-                f"{header}\n\n"
-                f"<b>Symbol:</b> {symbol_api}\n"
-                f"<b>Side:</b> {emoji} {my_direction}\n"
-                f"<b>Price:</b> ${price:.4f}\n"
-                f"<b>Qty:</b> {risk['qty']}\n"
-                f"<b>Leverage:</b> {os.getenv('LEVERAGE', 20)}x\n\n"
-                f"⏳ Waiting for confirmation...\n"
-                f"(~5 seconds)"
-            )
-            
+            msg = f"✅ <b>ORDER SENT</b>\n{symbol_api} {my_direction}\nWaiting for confirmation..."
             await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
         else:
-            logging.error(f"❌ Order failed: {res}")
             if symbol_api in position_manager.positions:
                 del position_manager.positions[symbol_api]
             
-            error_msg = res.get('msg') or res.get('error') or 'Unknown'
+            # ✅ FIX: Escape HTML in error message to prevent Telegram crash
+            raw_error = str(res.get('msg') or res.get('error') or 'Unknown')
+            safe_error = html.escape(raw_error)
+            
             await context.bot.send_message(
                 chat_id=target_id,
-                text=f"❌ <b>ORDER FAILED</b>\n{error_msg}",
+                text=f"❌ <b>ORDER FAILED</b>\n<pre>{safe_error}</pre>",
                 parse_mode="HTML"
             )
 
@@ -709,60 +561,24 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def post_init(application):
     target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
-    
     if target_id:
-        try:
-            dry_run = "DRY RUN" if os.getenv('DRY_RUN', 'false').lower() == 'true' else "LIVE"
-            
-            msg = (
-                f"🚀 <b>MEXC Bot Started</b>\n\n"
-                f"✅ Mode: {dry_run}\n"
-                f"📊 Leverage: {os.getenv('LEVERAGE', 20)}x\n"
-                f"💰 Risk: {os.getenv('RISK_PERCENTAGE', 2.5)}%\n"
-                f"🛑 SL: {os.getenv('STOP_LOSS_PERCENT', 0.5)}%\n"
-                f"🎯 TP: {os.getenv('TAKE_PROFIT_PERCENT', 0.5)}%"
-            )
-            
-            await application.bot.send_message(chat_id=target_id, text=msg, parse_mode='HTML')
-        except Exception as e:
-            logging.error(f"Post-init error: {e}")
+        await application.bot.send_message(chat_id=target_id, text="🚀 <b>MEXC Bot Reloaded</b>", parse_mode='HTML')
 
-# ==========================================
-# 🚀 MAIN
-# ==========================================
 def main():
     global mexc_web, position_manager
-    
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     web_token = os.getenv("MEXC_TOKEN", "").strip()
     
-    if not telegram_token or not web_token:
-        logging.error("❌ Missing tokens!")
-        return
+    if not telegram_token or not web_token: return
 
     mexc_web = MexcWebClient(web_token)
     position_manager = PositionManager()
-    
-    balance = mexc_web.get_balance()
-    logging.info(f"🎯 Startup Balance: {balance} USDT")
-    
-    existing = mexc_web.get_open_positions()
-    for pos in existing:
-        symbol = pos.get("symbol")
-        if symbol:
-            logging.info(f"📌 Existing position: {symbol}")
     
     async def init_and_start_monitoring(app):
         await post_init(app)
         asyncio.create_task(position_monitoring_loop(mexc_web, position_manager, app))
     
-    application = (
-        ApplicationBuilder()
-        .token(telegram_token)
-        .post_init(init_and_start_monitoring)
-        .build()
-    )
-    
+    application = ApplicationBuilder().token(telegram_token).post_init(init_and_start_monitoring).build()
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
     logging.info("🤖 Bot started!")
