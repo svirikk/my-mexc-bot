@@ -28,6 +28,52 @@ logging.basicConfig(
 )
 
 # ==========================================
+# ⏰ TRADING HOURS CHECK
+# ==========================================
+def is_trading_hours():
+    """
+    Перевіряє чи зараз дозволений час для торгівлі
+    
+    Returns:
+        tuple: (is_allowed: bool, reason: str)
+    """
+    enabled = os.getenv("TRADING_HOURS_ENABLED", "false").lower() == "true"
+    
+    # Якщо вимкнено - торгуємо 24/7
+    if not enabled:
+        return True, "24/7 mode"
+    
+    try:
+        start_hour = int(os.getenv("TRADING_START_HOUR_UTC", 0))
+        end_hour = int(os.getenv("TRADING_END_HOUR_UTC", 23))
+        
+        # Валідація годин
+        if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+            logging.error(f"❌ Невірні години: start={start_hour}, end={end_hour}")
+            return True, "Invalid hours config, trading allowed"
+        
+        # Поточний час UTC
+        now_utc = datetime.utcnow()
+        current_hour = now_utc.hour
+        
+        # Обробка випадку коли вікно перетинає добу (наприклад 22:00 → 05:00)
+        if start_hour <= end_hour:
+            # Звичайний випадок: 05:00 → 14:00
+            in_trading_hours = start_hour <= current_hour < end_hour
+        else:
+            # Вікно через північ: 22:00 → 05:00
+            in_trading_hours = current_hour >= start_hour or current_hour < end_hour
+        
+        if in_trading_hours:
+            return True, f"Trading hours {start_hour:02d}:00-{end_hour:02d}:00 UTC"
+        else:
+            return False, f"Outside trading hours (current: {current_hour:02d}:00 UTC, allowed: {start_hour:02d}:00-{end_hour:02d}:00 UTC)"
+            
+    except Exception as e:
+        logging.error(f"❌ Помилка перевірки trading hours: {e}")
+        return True, "Error checking hours, trading allowed"
+
+# ==========================================
 # 🔐 MEXC CRYPTO (WEB TOKEN)
 # ==========================================
 KEY_B = "1b8c71b668084dda9dc0285171ccf753".encode("utf-8")
@@ -483,6 +529,7 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
 # ==========================================
 position_manager = None
 mexc_web = None
+last_pause_notification = 0  # Timestamp останнього повідомлення про паузу
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global mexc_web, position_manager
@@ -511,6 +558,28 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         if balance < 5:
             await context.bot.send_message(chat_id=target_id, text=f"❌ Низький баланс: {balance} USDT")
             return
+
+        # ⏰ ПЕРЕВІРКА РОБОЧИХ ГОДИН
+        global last_pause_notification
+        is_allowed, reason = is_trading_hours()
+        
+        if not is_allowed:
+            logging.info(f"⏸️ Торгівля призупинена: {reason}")
+            
+            # Відправляємо повідомлення максимум раз на годину
+            current_time = time.time()
+            if current_time - last_pause_notification > 3600:  # 1 година
+                last_pause_notification = current_time
+                
+                pause_msg = (
+                    f"⏸️ <b>ТОРГІВЛЯ ПРИЗУПИНЕНА</b>\n\n"
+                    f"📊 Сигнал: {symbol_api} {my_direction}\n"
+                    f"⏰ {reason}\n\n"
+                    f"ℹ️ Бот продовжить торгівлю в робочі години"
+                )
+                await context.bot.send_message(chat_id=target_id, text=pause_msg, parse_mode="HTML")
+            
+            return  # Виходимо без відкриття позиції
 
         risk = calculate_risk_params(balance, price, my_direction)
         
@@ -568,7 +637,23 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def post_init(application):
     target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
     if target_id:
-        await application.bot.send_message(chat_id=target_id, text="🚀 <b>MEXC Bot v2.0 Запущено</b>\n<i>TP/SL в одному запиті</i>", parse_mode='HTML')
+        # Перевіряємо статус trading hours
+        is_allowed, reason = is_trading_hours()
+        hours_enabled = os.getenv("TRADING_HOURS_ENABLED", "false").lower() == "true"
+        
+        status_icon = "✅" if is_allowed else "⏸️"
+        mode_text = f"<i>Режим: {'Обмежені години' if hours_enabled else '24/7'}</i>\n"
+        hours_text = f"<i>{reason}</i>" if hours_enabled else ""
+        
+        startup_msg = (
+            f"🚀 <b>MEXC Bot v2.0 Запущено</b>\n"
+            f"{mode_text}"
+            f"{hours_text}\n"
+            f"{status_icon} <i>{'Торгівля активна' if is_allowed else 'Торгівля призупинена'}</i>\n\n"
+            f"<i>TP/SL в одному запиті</i>"
+        )
+        
+        await application.bot.send_message(chat_id=target_id, text=startup_msg, parse_mode='HTML')
 
 def main():
     global mexc_web, position_manager
