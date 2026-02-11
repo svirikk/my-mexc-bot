@@ -28,6 +28,47 @@ logging.basicConfig(
 )
 
 # ==========================================
+# ⚙️ CONTRACT SIZE MAPPING
+# ==========================================
+def load_contract_multipliers():
+    """
+    Завантажує маппінг контрактних мультиплікаторів з ENV
+    
+    Формат у .env файлі:
+    CONTRACT_MULTIPLIERS=HYPE_USDT:10,ADA_USDT:1,BTC_USDT:10000
+    
+    Де:
+    - HYPE_USDT:10 означає що для купівлі 1 монети HYPE потрібно 10 контрактів
+    - BTC_USDT:10000 означає що для купівлі 1 BTC потрібно 10000 контрактів (1 контракт = 0.0001 BTC)
+    
+    Returns:
+        dict: {'HYPE_USDT': 10, 'ADA_USDT': 1, ...}
+    """
+    multipliers = {}
+    mapping_str = os.getenv("CONTRACT_MULTIPLIERS", "")
+    
+    if not mapping_str:
+        logging.info("⚙️ CONTRACT_MULTIPLIERS не налаштовано - використовується 1:1 для всіх монет")
+        return multipliers
+    
+    try:
+        pairs = mapping_str.split(',')
+        for pair in pairs:
+            if ':' not in pair:
+                continue
+            symbol, multiplier = pair.strip().split(':')
+            multipliers[symbol.strip()] = float(multiplier.strip())
+        
+        logging.info(f"⚙️ Завантажено contract multipliers: {multipliers}")
+    except Exception as e:
+        logging.error(f"❌ Помилка парсингу CONTRACT_MULTIPLIERS: {e}")
+    
+    return multipliers
+
+# Завантажуємо маппінг при старті
+CONTRACT_MULTIPLIERS = load_contract_multipliers()
+
+# ==========================================
 # ⏰ TRADING HOURS CHECK
 # ==========================================
 def is_trading_hours():
@@ -458,9 +499,21 @@ class PositionManager:
         return symbol not in self.positions
 
 # ==========================================
-# 💰 RISK MANAGEMENT
+# 💰 RISK MANAGEMENT (ВИПРАВЛЕНО!)
 # ==========================================
-def calculate_risk_params(balance, price, direction):
+def calculate_risk_params(balance, price, direction, symbol):
+    """
+    Розраховує параметри ризику з урахуванням contract multiplier
+    
+    Args:
+        balance: Баланс в USDT
+        price: Ціна монети
+        direction: LONG або SHORT
+        symbol: Символ торгової пари (напр. HYPE_USDT)
+    
+    Returns:
+        dict: {'qty': кількість_контрактів, 'tp_percent': ..., 'sl_percent': ...}
+    """
     try:
         risk_pct = float(os.getenv("RISK_PERCENTAGE", 2.5))
         sl_pct = float(os.getenv("STOP_LOSS_PERCENT", 0.5))
@@ -468,17 +521,34 @@ def calculate_risk_params(balance, price, direction):
         
         risk_amount = balance * (risk_pct / 100)
         position_value_usd = risk_amount / (sl_pct / 100)
-        qty = int(position_value_usd / price)
-        if qty < 1: qty = 1
         
-        # Повертаємо лише кількість та відсотки
-        # TP/SL будуть розраховані від реальної ціни входу
+        # Розраховуємо кількість МОНЕТ (не контрактів)
+        qty_coins = position_value_usd / price
+        
+        # ⭐ НОВЕ: Отримуємо мультиплікатор для цього символу
+        multiplier = CONTRACT_MULTIPLIERS.get(symbol, 1.0)
+        
+        # Конвертуємо монети в контракти
+        qty_contracts = int(qty_coins * multiplier)
+        
+        if qty_contracts < 1:
+            qty_contracts = 1
+        
+        logging.info(f"💰 Розрахунок кількості для {symbol}:")
+        logging.info(f"  Баланс: {balance} USDT")
+        logging.info(f"  Ціна монети: {price} USDT")
+        logging.info(f"  Вартість позиції: {position_value_usd} USDT")
+        logging.info(f"  Монет потрібно: {qty_coins}")
+        logging.info(f"  Contract multiplier: {multiplier}")
+        logging.info(f"  ✅ Контрактів до купівлі: {qty_contracts}")
+        
         return {
-            "qty": qty, 
+            "qty": qty_contracts, 
             "tp_percent": tp_pct / 100,  # 0.005 для 0.5%
             "sl_percent": sl_pct / 100
         }
-    except:
+    except Exception as e:
+        logging.error(f"❌ Помилка розрахунку ризику: {e}")
         return None
 
 # ==========================================
@@ -581,7 +651,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             return  # Виходимо без відкриття позиції
 
-        risk = calculate_risk_params(balance, price, my_direction)
+        # ⭐ ВИПРАВЛЕНО: Передаємо symbol в calculate_risk_params
+        risk = calculate_risk_params(balance, price, my_direction, symbol_api)
         
         # Отримуємо tick size
         tick = mexc_web.get_tick_size(symbol_api)
@@ -645,11 +716,19 @@ async def post_init(application):
         mode_text = f"<i>Режим: {'Обмежені години' if hours_enabled else '24/7'}</i>\n"
         hours_text = f"<i>{reason}</i>" if hours_enabled else ""
         
+        # Додаємо інфу про contract multipliers
+        multipliers_text = ""
+        if CONTRACT_MULTIPLIERS:
+            multipliers_text = f"\n<i>Contract multipliers:</i>\n"
+            for symbol, mult in CONTRACT_MULTIPLIERS.items():
+                multipliers_text += f"  • {symbol}: {mult}x\n"
+        
         startup_msg = (
-            f"🚀 <b>MEXC Bot v2.0 Запущено</b>\n"
+            f"🚀 <b>MEXC Bot v2.1 Запущено</b>\n"
             f"{mode_text}"
             f"{hours_text}\n"
-            f"{status_icon} <i>{'Торгівля активна' if is_allowed else 'Торгівля призупинена'}</i>\n\n"
+            f"{status_icon} <i>{'Торгівля активна' if is_allowed else 'Торгівля призупинена'}</i>\n"
+            f"{multipliers_text}\n"
             f"<i>TP/SL в одному запиті</i>"
         )
         
