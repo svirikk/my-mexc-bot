@@ -119,6 +119,7 @@ class MexcWebClient:
         self.session = requests.Session()
         self.config_obj = None
         self.tick_cache = {}  # Кеш для tick sizes
+        self.contract_size_cache = {}  # ✨ НОВИЙ КЕШ для contract sizes
         self.base_headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             "Content-Type": "application/json",
@@ -198,288 +199,397 @@ class MexcWebClient:
             
             logging.info(f"📥 Відповідь статус: {resp.status_code}")
             
-            if resp.status_code == 403:
-                logging.error("❌ 403 Forbidden. WAF заблокував запит.")
-                return {"success": False, "error": "403 Forbidden"}
-
-            if not resp.text.strip():
-                logging.error("❌ Порожня відповідь від сервера")
-                return {"success": False, "error": "Empty response"}
-            
-            try:
+            if resp.status_code == 200:
                 return resp.json()
-            except json.JSONDecodeError as e:
-                logging.error(f"❌ Помилка JSON decode: {e}")
-                logging.error(f"Response text: {resp.text[:500]}")
-                return {"success": False, "error": f"Invalid JSON"}
-            
+            else:
+                logging.error(f"❌ HTTP {resp.status_code}: {resp.text[:200]}")
+                return {"code": resp.status_code, "msg": resp.text[:200]}
+                
         except Exception as e:
-            logging.error(f"❌ Помилка запиту: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            logging.error(f"❌ Помилка запиту: {e}")
+            return {"code": -1, "msg": str(e)}
 
-    def get_tick_size(self, symbol):
-        """Отримує tick size для символу"""
-        if symbol in self.tick_cache:
-            return self.tick_cache[symbol]
-        
+    # ✨ НОВИЙ МЕТОД: Отримання інформації про контракт
+    def get_contract_info(self, symbol: str) -> Dict:
+        """
+        Отримує інформацію про контракт з біржі.
+        Повертає: {
+            'contractSize': float,  # Скільки монет в 1 контракті (0.1 для HYPE)
+            'minQty': float,        # Мінімальна кількість контрактів
+            'tickSize': float       # Tick size для ціни
+        }
+        """
         try:
-            # Спроба отримати через contract info
             url = "https://contract.mexc.com/api/v1/contract/detail"
             params = {"symbol": symbol}
-            resp = self.session.get(url, params=params, timeout=5)
+            
+            resp = self.session.get(url, params=params, timeout=10)
             
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("success") and data.get("data"):
-                    tick = float(data["data"].get("priceUnit", 0.01))
-                    self.tick_cache[symbol] = tick
-                    logging.info(f"📐 Tick size для {symbol}: {tick}")
-                    return tick
+                    contract_data = data["data"]
+                    
+                    # contractSize - скільки монет в одному контракті
+                    contract_size = float(contract_data.get("contractSize", 1))
+                    
+                    # minVol - мінімальна кількість контрактів
+                    min_qty = float(contract_data.get("minVol", 1))
+                    
+                    # priceUnit - tick size для ціни
+                    tick_size = float(contract_data.get("priceUnit", 0.01))
+                    
+                    logging.info(
+                        f"📊 {symbol}: contractSize={contract_size}, "
+                        f"minQty={min_qty}, tickSize={tick_size}"
+                    )
+                    
+                    return {
+                        'contractSize': contract_size,
+                        'minQty': min_qty,
+                        'tickSize': tick_size
+                    }
+            
+            logging.warning(f"⚠️ Не вдалося отримати інфо для {symbol}, використовую defaults")
+            return {'contractSize': 1.0, 'minQty': 1.0, 'tickSize': 0.01}
+            
         except Exception as e:
-            logging.warning(f"Не вдалося отримати tick size для {symbol}: {e}")
-        
-        # Fallback на основі ціни
-        logging.warning(f"Використовую fallback tick size для {symbol}")
-        return 0.001  # Універсальний fallback
+            logging.error(f"❌ Помилка get_contract_info для {symbol}: {e}")
+            return {'contractSize': 1.0, 'minQty': 1.0, 'tickSize': 0.01}
 
-    def round_to_tick(self, price, tick, mode="nearest"):
+    # ✨ ОНОВЛЕНИЙ МЕТОД: Завантаження contract sizes для всіх дозволених монет
+    def load_contract_sizes(self, allowed_symbols: List[str]):
         """
-        Округлює ціну до tick size
-        mode: 'up', 'down', 'nearest'
+        Завантажує contract sizes для всіх дозволених монет при старті бота.
+        Кешує результати для швидкого доступу.
         """
+        logging.info("📥 Завантажую інформацію про контракти...")
+        
+        for symbol in allowed_symbols:
+            info = self.get_contract_info(symbol)
+            self.contract_size_cache[symbol] = info
+            
+            # Також оновлюємо tick_cache
+            self.tick_cache[symbol] = info['tickSize']
+            
+            # Невелика пауза між запитами
+            time.sleep(0.2)
+        
+        logging.info(f"✅ Завантажено інфо для {len(self.contract_size_cache)} монет")
+
+    def get_tick_size(self, symbol: str) -> float:
+        """Повертає tick size для символу (з кешу або дефолтне значення)"""
+        if symbol in self.tick_cache:
+            return self.tick_cache[symbol]
+        
+        # Якщо немає в кеші, пробуємо отримати
+        if symbol in self.contract_size_cache:
+            return self.contract_size_cache[symbol]['tickSize']
+        
+        # Дефолтне значення
+        return 0.01
+
+    def round_to_tick(self, price: float, tick: float) -> float:
+        """Округлює ціну до найближчого tick size"""
         if tick <= 0:
-            tick = 0.001
-        
-        if mode == "up":
-            return round((price // tick + 1) * tick, 10)
-        elif mode == "down":
-            return round((price // tick) * tick, 10)
-        else:  # nearest
-            return round(round(price / tick) * tick, 10)
+            return round(price, 2)
+        return round(price / tick) * tick
 
-    def calculate_tp_sl(self, entry_price, direction, tp_percent, sl_percent, tick):
-        """
-        Розраховує TP/SL з правильним округленням та валідацією
-        
-        Returns: (tp_price, sl_price)
-        """
-        logging.info(f"📊 Розрахунок TP/SL:")
-        logging.info(f"  Entry: {entry_price}, Direction: {direction}")
-        logging.info(f"  TP%: {tp_percent*100}%, SL%: {sl_percent*100}%")
-        logging.info(f"  Tick size: {tick}")
-        
-        # Розрахунок сирих значень
+    def calculate_tp_sl(self, entry_price: float, direction: str, tp_percent: float, sl_percent: float, tick: float):
+        """Розраховує ціни TP та SL"""
         if direction == "LONG":
-            tp_raw = entry_price * (1 + tp_percent)
-            sl_raw = entry_price * (1 - sl_percent)
-            
-            # Округлення для LONG: обидва DOWN
-            tp_price = self.round_to_tick(tp_raw, tick, "down")
-            sl_price = self.round_to_tick(sl_raw, tick, "down")
-            
+            tp_raw = entry_price * (1 + tp_percent / 100)
+            sl_raw = entry_price * (1 - sl_percent / 100)
         else:  # SHORT
-            tp_raw = entry_price * (1 - tp_percent)
-            sl_raw = entry_price * (1 + sl_percent)
-            
-            # Округлення для SHORT: обидва UP
-            tp_price = self.round_to_tick(tp_raw, tick, "up")
-            sl_price = self.round_to_tick(sl_raw, tick, "up")
+            tp_raw = entry_price * (1 - tp_percent / 100)
+            sl_raw = entry_price * (1 + sl_percent / 100)
         
-        logging.info(f"  TP raw: {tp_raw} -> rounded: {tp_price}")
-        logging.info(f"  SL raw: {sl_raw} -> rounded: {sl_price}")
+        tp = self.round_to_tick(tp_raw, tick)
+        sl = self.round_to_tick(sl_raw, tick)
         
-        # Валідація та корекція
-        if direction == "LONG":
-            # LONG: TP > entry, SL < entry
-            if tp_price <= entry_price:
-                tp_price = entry_price + tick
-                logging.warning(f"⚠️ TP скориговано: {tp_price}")
-            if sl_price >= entry_price:
-                sl_price = entry_price - tick
-                logging.warning(f"⚠️ SL скориговано: {sl_price}")
-        else:  # SHORT
-            # SHORT: TP < entry, SL > entry
-            if tp_price >= entry_price:
-                tp_price = entry_price - tick
-                logging.warning(f"⚠️ TP скориговано: {tp_price}")
-            if sl_price <= entry_price:
-                sl_price = entry_price + tick
-                logging.warning(f"⚠️ SL скориговано: {sl_price}")
-        
-        logging.info(f"✅ Фінальні значення: TP={tp_price}, SL={sl_price}")
-        
-        return tp_price, sl_price
+        return tp, sl
 
-    def open_position_with_sl_tp(self, symbol, direction, quantity, leverage, tp_price, sl_price):
-        """
-        Відкриває позицію з TP/SL в одному запиті через UI endpoint
-        """
-        side = 1 if direction == "LONG" else 3  # 1=Open Long, 3=Open Short
+    def get_balance(self) -> float:
+        """Отримує доступний баланс USDT"""
+        url = "https://contract.mexc.com/api/v1/private/account/assets"
+        body = {}
         
-        if isinstance(quantity, float) and quantity.is_integer():
-            quantity = int(quantity)
+        result = self._make_signed_request(url, body)
         
-        # ТОЧНА структура з DevTools
-        body_dict = {
-            "symbol": symbol,
-            "side": side,
-            "openType": 1,
-            "type": "5",  # STRING, market order
-            "vol": quantity,
-            "positionMode": 2,  # З DevTools
-            "marketCeiling": False,
-            "leverage": int(leverage),
-            "takeProfitPrice": str(tp_price),  # STRING!
-            "stopLossPrice": str(sl_price),    # STRING!
-            "profitTrend": "1",  # STRING!
-            "lossTrend": "1",    # STRING!
-            "priceProtect": "0"  # STRING!
-        }
-        
-        logging.info(f"📤 Відкриття позиції з TP/SL:")
-        logging.info(f"  Symbol: {symbol}, Side: {side} ({direction})")
-        logging.info(f"  Quantity: {quantity}, Leverage: {leverage}")
-        logging.info(f"  TP: {tp_price} (string: '{body_dict['takeProfitPrice']}')")
-        logging.info(f"  SL: {sl_price} (string: '{body_dict['stopLossPrice']}')")
-        logging.info(f"  profitTrend: '{body_dict['profitTrend']}', lossTrend: '{body_dict['lossTrend']}'")
-        
-        if os.getenv("DRY_RUN", "false").lower() == "true":
-            logging.info("🧪 DRY RUN MODE - не відправляю запит")
-            return {"success": True, "dry_run": True}
-        
-        # ПРАВИЛЬНИЙ UI endpoint
-        url = "https://www.mexc.com/api/platform/futures/api/v1/private/order/create"
-        result = self._make_signed_request(url, body_dict)
-        
-        return result
-
-    def get_balance(self):
-        try:
-            url = "https://contract.mexc.com/api/v1/private/account/assets"
-            result = self._make_signed_request(url, {}, method="GET")
-            
-            if not result.get("success"):
-                return 0.0
-
+        if result.get("success"):
             data = result.get("data", [])
-            if isinstance(data, list):
-                for item in data:
-                    if item.get("currency") == "USDT":
-                        bal = float(item.get("availableBalance", 0))
-                        logging.info(f"💰 Баланс Futures: {bal} USDT")
-                        return bal
-            return 0.0
-        except Exception as e:
-            logging.error(f"❌ Помилка балансу: {e}")
-            return 0.0
+            for asset in data:
+                if asset.get("currency") == "USDT":
+                    available = float(asset.get("availableBalance", 0))
+                    logging.info(f"💰 Баланс: {available} USDT")
+                    return available
+        
+        logging.warning("⚠️ Не вдалося отримати баланс")
+        return 0.0
 
-    def get_open_positions(self):
-        """Отримує всі відкриті позиції з біржі"""
+    def get_open_positions(self) -> List[Dict]:
+        """Отримує список відкритих позицій"""
+        url = "https://contract.mexc.com/api/v1/private/position/open_positions"
+        body = {}
+        
+        result = self._make_signed_request(url, body)
+        
+        if result.get("success"):
+            positions = result.get("data", [])
+            logging.info(f"📊 Відкритих позицій: {len(positions)}")
+            return positions
+        
+        return []
+
+    def open_position_with_sl_tp(self, symbol: str, direction: str, quantity: float, leverage: int, tp_price: float, sl_price: float) -> Dict:
+        """
+        Відкриває позицію з автоматичним встановленням TP/SL в одному запиті.
+        
+        ✨ ОНОВЛЕНО: quantity тепер вже в контрактах (не потрібно додаткове перетворення)
+        """
+        dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
+        
+        if dry_run:
+            logging.info(f"🧪 DRY RUN: {direction} {symbol}, qty={quantity}, lev={leverage}, tp={tp_price}, sl={sl_price}")
+            return {"dry_run": True, "msg": "DRY RUN mode"}
+
         try:
-            url = "https://contract.mexc.com/api/v1/private/position/open_positions"
-            result = self._make_signed_request(url, {}, method="GET")
-            if not result.get("success"):
-                return []
-            return result.get("data", [])
+            # Отримуємо поточну ціну для розрахунку vol (approximate)
+            url_price = "https://contract.mexc.com/api/v1/contract/ticker"
+            resp = self.session.get(url_price, params={"symbol": symbol}, timeout=10)
+            current_price = 1.0
+            
+            if resp.status_code == 200:
+                ticker_data = resp.json()
+                if ticker_data.get("success") and ticker_data.get("data"):
+                    current_price = float(ticker_data["data"][0].get("lastPrice", 1))
+
+            # vol = quantity * current_price (approximate)
+            vol = int(quantity * current_price)
+            
+            url = "https://www.mexc.com/api/contract/private/order/submit"
+            
+            body = {
+                "symbol": symbol,
+                "price": 0,
+                "vol": vol,
+                "leverage": leverage,
+                "side": 1 if direction == "LONG" else 2,  # 1=LONG(OPEN_LONG), 2=SHORT(OPEN_SHORT)
+                "type": 5,  # Market order
+                "openType": 2,  # Isolated margin
+                "stopLossPrice": sl_price,
+                "takeProfitPrice": tp_price,
+                "positionMode": 1  # One-way mode
+            }
+            
+            logging.info(f"📤 Відправляю ордер: {body}")
+            
+            result = self._make_signed_request(url, body)
+            
+            if result.get("code") == 0 or result.get("success"):
+                logging.info(f"✅ Позицію відкрито: {symbol} {direction}")
+                return {"success": True, "data": result.get("data")}
+            else:
+                error_msg = result.get("msg") or result.get("message") or "Unknown error"
+                logging.error(f"❌ Помилка відкриття: {error_msg}")
+                return {"success": False, "msg": error_msg}
+                
         except Exception as e:
-            logging.error(f"❌ Помилка позицій: {e}")
-            return []
+            logging.error(f"❌ Exception при відкритті позиції: {e}")
+            return {"success": False, "error": str(e)}
 
 # ==========================================
-# 🎯 STATE MACHINE
+# 📊 POSITION MANAGER
 # ==========================================
 class PositionState(Enum):
-    NO_POSITION = "no_position"
-    OPENING = "opening"
+    SIGNAL_RECEIVED = "signal_received"
     POSITION_DETECTED = "position_detected"
+    POSITION_CLOSED = "position_closed"  # ✨ НОВИЙ СТАН
 
 @dataclass
 class ManagedPosition:
     symbol: str
+    signal_direction: str  # "LONG" / "SHORT"
+    target_sl: float
+    target_tp: float
     state: PositionState
-    signal_direction: str
-    signal_time: float
-    current_size: float = 0.0
     entry_price: float = 0.0
-    position_side: int = 0
-    last_check: float = 0.0
-    target_sl: float = 0.0
-    target_tp: float = 0.0
+    current_size: float = 0.0
+    signal_time: float = 0.0
+    
+    # ✨ НОВІ ПОЛЯ для відстеження закритих позицій
+    close_price: float = 0.0
+    close_time: float = 0.0
+    pnl_usdt: float = 0.0
+    pnl_percent: float = 0.0
 
 class PositionManager:
     def __init__(self):
         self.positions: Dict[str, ManagedPosition] = {}
-        self.opening_timeout = 30
-    
-    def add_signal(self, symbol: str, direction: str, sl_price: float, tp_price: float):
-        self.positions[symbol] = ManagedPosition(
-            symbol=symbol,
-            state=PositionState.OPENING,
-            signal_direction=direction,
-            signal_time=time.time(),
-            target_sl=sl_price,
-            target_tp=tp_price
-        )
-        logging.info(f"📡 Сигнал: {symbol} {direction}")
-    
-    def update_from_exchange(self, exchange_positions: List[Dict]):
-        exchange_symbols = {}
-        for pos in exchange_positions:
-            symbol = pos.get("symbol")
-            size = abs(float(pos.get("holdVol", 0)))
-            if size > 0:
-                exchange_symbols[symbol] = {
-                    "size": size,
-                    "entry_price": float(pos.get("openAvgPrice", 0)),
-                    "side": pos.get("positionType")
-                }
-        
-        for symbol, managed in list(self.positions.items()):
-            if managed.state == PositionState.OPENING:
-                if symbol in exchange_symbols:
-                    ex_pos = exchange_symbols[symbol]
-                    managed.state = PositionState.POSITION_DETECTED
-                    managed.current_size = ex_pos["size"]
-                    managed.entry_price = ex_pos["entry_price"]
-                    managed.position_side = ex_pos["side"]
-                    logging.info(f"✅ ПОЗИЦІЯ ВІДКРИТА: {symbol}")
-                elif time.time() - managed.signal_time > self.opening_timeout:
-                    logging.warning(f"⏱️ ТАЙМАУТ: {symbol}")
-                    del self.positions[symbol]
-            elif managed.state == PositionState.POSITION_DETECTED:
-                if symbol in exchange_symbols:
-                    ex_pos = exchange_symbols[symbol]
-                    managed.current_size = ex_pos["size"]
-                else:
-                    logging.warning(f"🔔 ПОЗИЦІЯ ЗАКРИТА: {symbol}")
-                    del self.positions[symbol]
+        self.closed_positions: Dict[str, ManagedPosition] = {}  # ✨ НОВИЙ: історія закритих
+        self.cooldown_seconds = 300
     
     def can_accept_signal(self, symbol: str) -> bool:
-        return symbol not in self.positions
+        """Перевіряє чи можна прийняти новий сигнал"""
+        if symbol in self.positions:
+            managed = self.positions[symbol]
+            elapsed = time.time() - managed.signal_time
+            
+            if elapsed < self.cooldown_seconds:
+                logging.info(f"⏳ Cooldown для {symbol}: {int(self.cooldown_seconds - elapsed)}s")
+                return False
+        
+        return True
+    
+    def add_signal(self, symbol: str, direction: str, sl: float, tp: float):
+        """Додає новий сигнал до менеджера"""
+        self.positions[symbol] = ManagedPosition(
+            symbol=symbol,
+            signal_direction=direction,
+            target_sl=sl,
+            target_tp=tp,
+            state=PositionState.SIGNAL_RECEIVED,
+            signal_time=time.time()
+        )
+        logging.info(f"📝 Сигнал збережено: {symbol} {direction}")
+    
+    def update_from_exchange(self, exchange_positions: List[Dict]):
+        """
+        Оновлює стан позицій на основі даних з біржі.
+        
+        ✨ ОНОВЛЕНО: Тепер також відстежує закриті позиції
+        """
+        # Створюємо словник відкритих позицій на біржі
+        open_symbols = {}
+        for pos in exchange_positions:
+            symbol = pos.get("symbol")
+            if symbol:
+                open_symbols[symbol] = pos
+        
+        # Перевіряємо наші відстежувані позиції
+        for symbol, managed in list(self.positions.items()):
+            
+            if symbol in open_symbols:
+                # Позиція ще відкрита на біржі
+                exchange_pos = open_symbols[symbol]
+                
+                # Оновлюємо дані позиції
+                if managed.state == PositionState.SIGNAL_RECEIVED:
+                    managed.state = PositionState.POSITION_DETECTED
+                    managed.entry_price = float(exchange_pos.get("openAvgPrice", 0))
+                    managed.current_size = abs(float(exchange_pos.get("holdVol", 0)))
+                    logging.info(f"✅ Позицію підтверджено: {symbol} @ ${managed.entry_price}")
+                
+                # Оновлюємо поточний розмір
+                managed.current_size = abs(float(exchange_pos.get("holdVol", 0)))
+                
+            else:
+                # Позиція закрита на біржі
+                if managed.state == PositionState.POSITION_DETECTED:
+                    # ✨ НОВА ЛОГІКА: Позиція була відкрита і тепер закрита
+                    logging.info(f"🔔 Позиція закрита: {symbol}")
+                    
+                    # Переміщуємо в закриті позиції для повідомлення
+                    managed.state = PositionState.POSITION_CLOSED
+                    managed.close_time = time.time()
+                    
+                    # Зберігаємо для обробки в моніторингу
+                    self.closed_positions[symbol] = managed
 
 # ==========================================
-# 💰 RISK MANAGEMENT
+# 💰 RISK CALCULATION
 # ==========================================
-def calculate_risk_params(balance, price, direction):
+def calculate_risk_params(balance: float, price: float, direction: str, contract_size: float = 1.0) -> dict:
+    """
+    Розраховує параметри ризику для позиції.
+    
+    ✨ ОНОВЛЕНО: Додано параметр contract_size для правильного розрахунку кількості контрактів
+    
+    Args:
+        balance: Доступний баланс в USDT
+        price: Поточна ціна монети
+        direction: "LONG" або "SHORT"
+        contract_size: Скільки монет в одному контракті (наприклад, 0.1 для HYPE)
+    
+    Returns:
+        dict: {
+            'qty': int,  # Кількість КОНТРАКТІВ для відкриття
+            'tp_percent': float,
+            'sl_percent': float
+        }
+    """
     try:
-        risk_pct = float(os.getenv("RISK_PERCENTAGE", 2.5))
-        sl_pct = float(os.getenv("STOP_LOSS_PERCENT", 0.5))
-        tp_pct = float(os.getenv("TAKE_PROFIT_PERCENT", 0.5))
+        risk_percent = float(os.getenv("RISK_PERCENT", 3))
+        tp_percent = float(os.getenv("TP_PERCENT", 10))
+        sl_percent = float(os.getenv("SL_PERCENT", 2))
+        leverage = int(os.getenv("LEVERAGE", 20))
         
-        risk_amount = balance * (risk_pct / 100)
-        position_value_usd = risk_amount / (sl_pct / 100)
-        qty = int(position_value_usd / price)
-        if qty < 1: qty = 1
+        # Сума під ризик
+        risk_amount = balance * (risk_percent / 100)
         
-        # Повертаємо лише кількість та відсотки
-        # TP/SL будуть розраховані від реальної ціни входу
+        # Позиційний розмір з урахуванням кредитного плеча
+        position_value = risk_amount * leverage
+        
+        # Кількість МОНЕТ які ми хочемо купити
+        qty_coins = position_value / price
+        
+        # ✨ КЛЮЧОВА ЗМІНА: Конвертуємо монети в контракти
+        # Якщо 1 контракт = 0.1 монети (contract_size = 0.1)
+        # То для покупки 1 монети потрібно 1 / 0.1 = 10 контрактів
+        qty_contracts = qty_coins / contract_size
+        
+        # Округлюємо до цілого числа контрактів
+        qty_contracts = max(1, int(qty_contracts))
+        
+        logging.info(
+            f"💰 Розрахунок: Balance={balance:.2f}, Risk={risk_percent}%, "
+            f"Position=${position_value:.2f}, Price=${price:.4f}, "
+            f"ContractSize={contract_size}, "
+            f"Монет={qty_coins:.2f} → Контрактів={qty_contracts}"
+        )
+        
         return {
-            "qty": qty, 
-            "tp_percent": tp_pct / 100,  # 0.005 для 0.5%
-            "sl_percent": sl_pct / 100
+            'qty': qty_contracts,
+            'tp_percent': tp_percent,
+            'sl_percent': sl_percent
         }
     except:
-        return None
+        return {
+            'qty': 1,
+            'tp_percent': 10.0,
+            'sl_percent': 2.0
+        }
+
+# ✨ НОВА ФУНКЦІЯ: Розрахунок PnL
+def calculate_pnl(entry_price: float, close_price: float, size: float, direction: str) -> tuple:
+    """
+    Розраховує прибуток/збиток позиції.
+    
+    Args:
+        entry_price: Ціна входу
+        close_price: Ціна закриття (можна взяти поточну ціну як approximation)
+        size: Розмір позиції в контрактах
+        direction: "LONG" або "SHORT"
+    
+    Returns:
+        tuple: (pnl_usdt: float, pnl_percent: float)
+    """
+    if entry_price <= 0 or close_price <= 0:
+        return 0.0, 0.0
+    
+    if direction == "LONG":
+        # Для LONG: прибуток якщо ціна виросла
+        price_change_percent = ((close_price - entry_price) / entry_price) * 100
+    else:
+        # Для SHORT: прибуток якщо ціна впала
+        price_change_percent = ((entry_price - close_price) / entry_price) * 100
+    
+    # PnL в USDT (approximate, без врахування комісій та точного розміру)
+    # Точний розрахунок вимагає знання точного розміру в USDT
+    position_value = size * entry_price
+    pnl_usdt = position_value * (price_change_percent / 100)
+    
+    return pnl_usdt, price_change_percent
 
 # ==========================================
 # 🔄 MONITORING LOOP
@@ -490,14 +600,14 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
     
     while True:
         try:
-            if len(manager.positions) == 0:
+            if len(manager.positions) == 0 and len(manager.closed_positions) == 0:
                 await asyncio.sleep(check_interval)
                 continue
             
             exchange_positions = web_client.get_open_positions()
             manager.update_from_exchange(exchange_positions)
             
-            # Повідомлення про підтверджені позиції
+            # Повідомлення про підтверджені позиції (як і раніше)
             for symbol, managed in list(manager.positions.items()):
                 if managed.state == PositionState.POSITION_DETECTED and managed.entry_price > 0:
                     target_id = os.getenv("SIGNAL_CHANNEL_ID")
@@ -515,7 +625,76 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                     
                     await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
                     
-                    # Видаляємо з менеджера після повідомлення
+                    # НЕ видаляємо з менеджера - продовжуємо відстежувати для повідомлення про закриття
+                    # Просто змінюємо стан щоб не слати повторні повідомлення
+                    managed.state = PositionState.POSITION_DETECTED
+            
+            # ✨ НОВА ЛОГІКА: Повідомлення про закриті позиції
+            for symbol, managed in list(manager.closed_positions.items()):
+                target_id = os.getenv("SIGNAL_CHANNEL_ID")
+                
+                # Отримуємо поточну ціну як approximation ціни закриття
+                try:
+                    url_price = "https://contract.mexc.com/api/v1/contract/ticker"
+                    resp = web_client.session.get(url_price, params={"symbol": symbol}, timeout=10)
+                    close_price = managed.entry_price  # Fallback
+                    
+                    if resp.status_code == 200:
+                        ticker_data = resp.json()
+                        if ticker_data.get("success") and ticker_data.get("data"):
+                            close_price = float(ticker_data["data"][0].get("lastPrice", managed.entry_price))
+                    
+                    # Розраховуємо PnL
+                    pnl_usdt, pnl_percent = calculate_pnl(
+                        entry_price=managed.entry_price,
+                        close_price=close_price,
+                        size=managed.current_size,
+                        direction=managed.signal_direction
+                    )
+                    
+                    # Визначаємо результат (TP, SL, або Manual)
+                    result_type = "ЗАКРИТО"
+                    result_icon = "⚪"
+                    
+                    # Перевіряємо чи близько до TP або SL
+                    if managed.signal_direction == "LONG":
+                        if close_price >= managed.target_tp * 0.99:  # Близько до TP
+                            result_type = "TAKE PROFIT"
+                            result_icon = "✅"
+                        elif close_price <= managed.target_sl * 1.01:  # Близько до SL
+                            result_type = "STOP LOSS"
+                            result_icon = "🛑"
+                    else:  # SHORT
+                        if close_price <= managed.target_tp * 1.01:
+                            result_type = "TAKE PROFIT"
+                            result_icon = "✅"
+                        elif close_price >= managed.target_sl * 0.99:
+                            result_type = "STOP LOSS"
+                            result_icon = "🛑"
+                    
+                    # Формуємо повідомлення
+                    pnl_sign = "+" if pnl_usdt >= 0 else ""
+                    msg = (
+                        f"{result_icon} <b>{result_type}</b>\n\n"
+                        f"<b>Символ:</b> {symbol}\n"
+                        f"<b>Бік:</b> {managed.signal_direction}\n"
+                        f"<b>Вхід:</b> ${managed.entry_price:.4f}\n"
+                        f"<b>Вихід:</b> ${close_price:.4f}\n"
+                        f"<b>Розмір:</b> {managed.current_size}\n\n"
+                        f"💰 <b>PnL:</b> {pnl_sign}{pnl_usdt:.2f} USDT ({pnl_sign}{pnl_percent:.2f}%)\n"
+                    )
+                    
+                    await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
+                    logging.info(f"📤 Відправлено повідомлення про закриття: {symbol}")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Помилка при обробці закритої позиції {symbol}: {e}")
+                
+                # Видаляємо з закритих після відправки повідомлення
+                del manager.closed_positions[symbol]
+                
+                # Також видаляємо з активних позицій
+                if symbol in manager.positions:
                     del manager.positions[symbol]
             
             await asyncio.sleep(check_interval)
@@ -581,10 +760,21 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             return  # Виходимо без відкриття позиції
 
-        risk = calculate_risk_params(balance, price, my_direction)
+        # ✨ ОНОВЛЕНО: Отримуємо інформацію про контракт з кешу
+        contract_info = mexc_web.contract_size_cache.get(symbol_api)
         
-        # Отримуємо tick size
-        tick = mexc_web.get_tick_size(symbol_api)
+        if not contract_info:
+            # Якщо чомусь немає в кеші, отримуємо зараз
+            contract_info = mexc_web.get_contract_info(symbol_api)
+            mexc_web.contract_size_cache[symbol_api] = contract_info
+        
+        contract_size = contract_info['contractSize']
+        tick = contract_info['tickSize']
+        
+        logging.info(f"📊 {symbol_api}: ContractSize={contract_size}, TickSize={tick}")
+
+        # ✨ ОНОВЛЕНО: Передаємо contract_size в розрахунок ризику
+        risk = calculate_risk_params(balance, price, my_direction, contract_size)
         
         # Розраховуємо TP/SL від поточної ціни (як approximation)
         tp_price, sl_price = mexc_web.calculate_tp_sl(
@@ -597,12 +787,12 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         position_manager.add_signal(symbol_api, my_direction, sl_price, tp_price)
         
-        logging.info(f"🚀 Відкриваю {my_direction} {symbol_api}, Кількість: {risk['qty']}")
+        logging.info(f"🚀 Відкриваю {my_direction} {symbol_api}, Контрактів: {risk['qty']}")
 
         res = mexc_web.open_position_with_sl_tp(
             symbol=symbol_api,
             direction=my_direction,
-            quantity=risk['qty'],
+            quantity=risk['qty'],  # Вже в контрактах!
             leverage=int(os.getenv("LEVERAGE", 20)),
             tp_price=tp_price,
             sl_price=sl_price
@@ -612,7 +802,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             msg = (
                 f"✅ <b>ОРДЕР ВІДПРАВЛЕНО</b>\n\n"
                 f"{symbol_api} {my_direction}\n"
-                f"Розмір: {risk['qty']}\n"
+                f"Контрактів: {risk['qty']}\n"
                 f"🎯 TP: ${tp_price}\n"
                 f"🛑 SL: ${sl_price}\n\n"
                 f"Очікування підтвердження..."
@@ -646,11 +836,12 @@ async def post_init(application):
         hours_text = f"<i>{reason}</i>" if hours_enabled else ""
         
         startup_msg = (
-            f"🚀 <b>MEXC Bot v2.0 Запущено</b>\n"
+            f"🚀 <b>MEXC Bot v2.1 Запущено</b>\n"
             f"{mode_text}"
             f"{hours_text}\n"
             f"{status_icon} <i>{'Торгівля активна' if is_allowed else 'Торгівля призупинена'}</i>\n\n"
-            f"<i>TP/SL в одному запиті</i>"
+            f"<i>✨ ContractSize підтримка\n"
+            f"✨ Повідомлення про закриття</i>"
         )
         
         await application.bot.send_message(chat_id=target_id, text=startup_msg, parse_mode='HTML')
@@ -664,6 +855,13 @@ def main():
 
     mexc_web = MexcWebClient(web_token)
     position_manager = PositionManager()
+    
+    # ✨ НОВИЙ КОД: Завантажуємо інформацію про контракти для дозволених монет
+    allowed_symbols_str = os.getenv("ALLOWED_SYMBOLS", "BTC_USDT,ETH_USDT")
+    allowed_symbols = [s.strip() for s in allowed_symbols_str.split(",")]
+    
+    logging.info(f"📋 Дозволені монети: {allowed_symbols}")
+    mexc_web.load_contract_sizes(allowed_symbols)
     
     async def init_and_start_monitoring(app):
         await post_init(app)
