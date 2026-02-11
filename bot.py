@@ -74,6 +74,40 @@ def is_trading_hours():
         return True, "Error checking hours, trading allowed"
 
 # ==========================================
+# 🔄 SYMBOL NORMALIZATION
+# ==========================================
+def normalize_symbol_to_mexc_contract(symbol: str) -> str:
+    """
+    Нормалізує символ до формату MEXC Futures з підкресленням.
+    
+    Приклади:
+        ADAUSDT → ADA_USDT
+        BTCUSDT → BTC_USDT
+        BTC_USDT → BTC_USDT (вже нормалізований)
+        HYPEUSDT → HYPE_USDT
+    
+    Args:
+        symbol: Символ у будь-якому форматі
+    
+    Returns:
+        str: Нормалізований символ з підкресленням (наприклад, ADA_USDT)
+    """
+    # Видаляємо пробіли
+    symbol = symbol.strip().upper()
+    
+    # Якщо вже є підкреслення, повертаємо як є
+    if '_' in symbol:
+        return symbol
+    
+    # Якщо закінчується на USDT і немає підкреслення
+    if symbol.endswith('USDT'):
+        base = symbol[:-4]  # Видаляємо USDT
+        return f"{base}_USDT"
+    
+    # Якщо формат невідомий, повертаємо як є
+    return symbol
+
+# ==========================================
 # 🔐 MEXC CRYPTO (WEB TOKEN)
 # ==========================================
 KEY_B = "1b8c71b668084dda9dc0285171ccf753".encode("utf-8")
@@ -118,8 +152,7 @@ class MexcWebClient:
         self.crypto = MexcCrypto()
         self.session = requests.Session()
         self.config_obj = None
-        self.tick_cache = {}  # Кеш для tick sizes
-        self.contract_size_cache = {}  # ✨ НОВИЙ КЕШ для contract sizes
+        self.contract_size_cache = {}  # ✨ Кеш для contract sizes: {"ADA_USDT": {"contractSize": 1, "tickSize": 0.001, ...}}
         self.base_headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             "Content-Type": "application/json",
@@ -189,8 +222,6 @@ class MexcWebClient:
                 headers["Referer"] = "https://www.mexc.com/"
             
             logging.info(f"🔗 Запит: {method} {url}")
-            logging.info(f"🏠 Hostname для encryption: {hostname}")
-            logging.info(f"🔑 Auth fields: p0={len(p0)} chars, k0={len(k0)} chars, chash={bool(self.config_obj['chash'])}")
             
             if method == "GET":
                 resp = self.session.get(url, params=body_dict, headers=headers, timeout=10)
@@ -209,85 +240,177 @@ class MexcWebClient:
             logging.error(f"❌ Помилка запиту: {e}")
             return {"code": -1, "msg": str(e)}
 
-    # ✨ НОВИЙ МЕТОД: Отримання інформації про контракт
-    def get_contract_info(self, symbol: str) -> Dict:
+    # ==========================================
+    # ✨ НОВА ЛОГІКА ЗАВАНТАЖЕННЯ CONTRACT SIZES
+    # ==========================================
+    def load_contract_sizes(self):
         """
-        Отримує інформацію про контракт з біржі.
-        Повертає: {
-            'contractSize': float,  # Скільки монет в 1 контракті (0.1 для HYPE)
-            'minQty': float,        # Мінімальна кількість контрактів
-            'tickSize': float       # Tick size для ціни
+        Завантажує ВСІ контракти з MEXC Futures одним запитом.
+        
+        API: GET https://contract.mexc.com/api/v1/contract/detail
+        Це PUBLIC endpoint, повертає масив всіх доступних контрактів.
+        
+        Кешує результати в self.contract_size_cache у форматі:
+        {
+            "ADA_USDT": {
+                "contractSize": 1.0,
+                "tickSize": 0.001,
+                "minQty": 1
+            },
+            "HYPE_USDT": {
+                "contractSize": 0.1,
+                "tickSize": 0.0001,
+                "minQty": 1
+            }
         }
         """
         try:
+            logging.info("📥 Завантажую інформацію про всі контракти з MEXC Futures...")
+            
             url = "https://contract.mexc.com/api/v1/contract/detail"
-            params = {"symbol": symbol}
             
-            resp = self.session.get(url, params=params, timeout=10)
+            # PUBLIC endpoint - не потрібні ключі чи параметри
+            resp = self.session.get(url, timeout=15)
             
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("success") and data.get("data"):
-                    contract_data = data["data"]
+            if resp.status_code != 200:
+                logging.error(f"❌ API відповів з кодом {resp.status_code}")
+                logging.error(f"Response: {resp.text[:500]}")
+                return
+            
+            data = resp.json()
+            
+            # Перевіряємо структуру відповіді
+            if not data.get("success"):
+                logging.error(f"❌ API повернув success=false: {data}")
+                return
+            
+            contracts_data = data.get("data")
+            if not contracts_data:
+                logging.error("❌ API не повернув жодного контракту (data is empty)")
+                return
+            
+            # Якщо data - це список контрактів
+            if isinstance(contracts_data, list):
+                contracts = contracts_data
+            # Якщо data - це словник з ключем contracts або іншим
+            elif isinstance(contracts_data, dict):
+                # Можливі варіанти структури
+                if 'contracts' in contracts_data:
+                    contracts = contracts_data['contracts']
+                else:
+                    # Беремо першу значущу колекцію
+                    contracts = []
+                    for value in contracts_data.values():
+                        if isinstance(value, list):
+                            contracts = value
+                            break
+            else:
+                logging.error(f"❌ Невідома структура data: {type(contracts_data)}")
+                return
+            
+            if not contracts:
+                logging.error("❌ Список контрактів порожній")
+                return
+            
+            logging.info(f"📊 Отримано {len(contracts)} контрактів з API")
+            
+            # Обробляємо контракти
+            loaded_count = 0
+            for contract in contracts:
+                try:
+                    symbol = contract.get("symbol")
+                    if not symbol:
+                        continue
                     
-                    # contractSize - скільки монет в одному контракті
-                    contract_size = float(contract_data.get("contractSize", 1))
+                    # Переконуємося що символ має підкреслення (ADA_USDT)
+                    symbol_normalized = normalize_symbol_to_mexc_contract(symbol)
                     
-                    # minVol - мінімальна кількість контрактів
-                    min_qty = float(contract_data.get("minVol", 1))
+                    # Витягуємо дані
+                    contract_size = float(contract.get("contractSize", 1))
+                    tick_size = float(contract.get("priceUnit", 0.01))
+                    min_qty = float(contract.get("minVol", 1))
                     
-                    # priceUnit - tick size для ціни
-                    tick_size = float(contract_data.get("priceUnit", 0.01))
-                    
-                    logging.info(
-                        f"📊 {symbol}: contractSize={contract_size}, "
-                        f"minQty={min_qty}, tickSize={tick_size}"
-                    )
-                    
-                    return {
-                        'contractSize': contract_size,
-                        'minQty': min_qty,
-                        'tickSize': tick_size
+                    # Зберігаємо в кеш
+                    self.contract_size_cache[symbol_normalized] = {
+                        "contractSize": contract_size,
+                        "tickSize": tick_size,
+                        "minQty": min_qty
                     }
+                    
+                    loaded_count += 1
+                    
+                except Exception as e:
+                    logging.warning(f"⚠️ Помилка обробки контракту: {e}")
+                    continue
             
-            logging.warning(f"⚠️ Не вдалося отримати інфо для {symbol}, використовую defaults")
-            return {'contractSize': 1.0, 'minQty': 1.0, 'tickSize': 0.01}
+            logging.info(f"✅ Завантажено контракти: {loaded_count}/{len(contracts)}")
             
+            # Логуємо приклади для дебагу
+            if self.contract_size_cache:
+                examples = list(self.contract_size_cache.items())[:5]
+                logging.info("📋 Приклади завантажених контрактів:")
+                for symbol, info in examples:
+                    logging.info(
+                        f"  • {symbol}: contractSize={info['contractSize']}, "
+                        f"tickSize={info['tickSize']}, minQty={info['minQty']}"
+                    )
+            
+            # ✅ Тест для HYPE_USDT
+            if "HYPE_USDT" in self.contract_size_cache:
+                hype_info = self.contract_size_cache["HYPE_USDT"]
+                hype_contract_size = hype_info["contractSize"]
+                
+                # Якщо треба купити 2 HYPE і contractSize=0.1
+                # То contracts = 2 / 0.1 = 20
+                test_coins = 2.0
+                test_contracts = test_coins / hype_contract_size
+                
+                logging.info(
+                    f"🧪 ТЕСТ HYPE_USDT: contractSize={hype_contract_size}, "
+                    f"щоб купити {test_coins} HYPE потрібно {test_contracts:.0f} контрактів"
+                )
+                
+                if hype_contract_size == 0.1 and test_contracts == 20:
+                    logging.info("✅ ТЕСТ ПРОЙДЕНО!")
+                else:
+                    logging.warning(f"⚠️ ТЕСТ НЕ ПРОЙДЕНО: очікувалось 20 контрактів")
+                    
         except Exception as e:
-            logging.error(f"❌ Помилка get_contract_info для {symbol}: {e}")
-            return {'contractSize': 1.0, 'minQty': 1.0, 'tickSize': 0.01}
+            logging.error(f"❌ Критична помилка load_contract_sizes: {e}", exc_info=True)
 
-    # ✨ ОНОВЛЕНИЙ МЕТОД: Завантаження contract sizes для всіх дозволених монет
-    def load_contract_sizes(self, allowed_symbols: List[str]):
+    def get_contract_info(self, symbol: str) -> Dict:
         """
-        Завантажує contract sizes для всіх дозволених монет при старті бота.
-        Кешує результати для швидкого доступу.
+        Отримує інформацію про контракт з кешу.
+        
+        Args:
+            symbol: Символ (може бути ADAUSDT або ADA_USDT)
+        
+        Returns:
+            dict: {"contractSize": float, "tickSize": float, "minQty": float}
         """
-        logging.info("📥 Завантажую інформацію про контракти...")
+        # Нормалізуємо символ
+        symbol_normalized = normalize_symbol_to_mexc_contract(symbol)
         
-        for symbol in allowed_symbols:
-            info = self.get_contract_info(symbol)
-            self.contract_size_cache[symbol] = info
-            
-            # Також оновлюємо tick_cache
-            self.tick_cache[symbol] = info['tickSize']
-            
-            # Невелика пауза між запитами
-            time.sleep(0.2)
+        # Шукаємо в кеші
+        if symbol_normalized in self.contract_size_cache:
+            return self.contract_size_cache[symbol_normalized]
         
-        logging.info(f"✅ Завантажено інфо для {len(self.contract_size_cache)} монет")
+        # Fallback
+        logging.warning(
+            f"⚠️ ContractSize не знайдено для {symbol_normalized}, "
+            f"використовую defaults (contractSize=1)"
+        )
+        
+        return {
+            "contractSize": 1.0,
+            "tickSize": 0.01,
+            "minQty": 1.0
+        }
 
     def get_tick_size(self, symbol: str) -> float:
-        """Повертає tick size для символу (з кешу або дефолтне значення)"""
-        if symbol in self.tick_cache:
-            return self.tick_cache[symbol]
-        
-        # Якщо немає в кеші, пробуємо отримати
-        if symbol in self.contract_size_cache:
-            return self.contract_size_cache[symbol]['tickSize']
-        
-        # Дефолтне значення
-        return 0.01
+        """Повертає tick size для символу"""
+        info = self.get_contract_info(symbol)
+        return info['tickSize']
 
     def round_to_tick(self, price: float, tick: float) -> float:
         """Округлює ціну до найближчого tick size"""
@@ -345,7 +468,13 @@ class MexcWebClient:
         """
         Відкриває позицію з автоматичним встановленням TP/SL в одному запиті.
         
-        ✨ ОНОВЛЕНО: quantity тепер вже в контрактах (не потрібно додаткове перетворення)
+        Args:
+            symbol: Символ контракту (ADA_USDT)
+            direction: "LONG" або "SHORT"
+            quantity: Кількість КОНТРАКТІВ (вже конвертовано!)
+            leverage: Кредитне плече
+            tp_price: Ціна Take Profit
+            sl_price: Ціна Stop Loss
         """
         dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
         
@@ -404,7 +533,7 @@ class MexcWebClient:
 class PositionState(Enum):
     SIGNAL_RECEIVED = "signal_received"
     POSITION_DETECTED = "position_detected"
-    POSITION_CLOSED = "position_closed"  # ✨ НОВИЙ СТАН
+    POSITION_CLOSED = "position_closed"
 
 @dataclass
 class ManagedPosition:
@@ -417,7 +546,7 @@ class ManagedPosition:
     current_size: float = 0.0
     signal_time: float = 0.0
     
-    # ✨ НОВІ ПОЛЯ для відстеження закритих позицій
+    # Поля для відстеження закритих позицій
     close_price: float = 0.0
     close_time: float = 0.0
     pnl_usdt: float = 0.0
@@ -426,7 +555,7 @@ class ManagedPosition:
 class PositionManager:
     def __init__(self):
         self.positions: Dict[str, ManagedPosition] = {}
-        self.closed_positions: Dict[str, ManagedPosition] = {}  # ✨ НОВИЙ: історія закритих
+        self.closed_positions: Dict[str, ManagedPosition] = {}
         self.cooldown_seconds = 300
     
     def can_accept_signal(self, symbol: str) -> bool:
@@ -454,11 +583,7 @@ class PositionManager:
         logging.info(f"📝 Сигнал збережено: {symbol} {direction}")
     
     def update_from_exchange(self, exchange_positions: List[Dict]):
-        """
-        Оновлює стан позицій на основі даних з біржі.
-        
-        ✨ ОНОВЛЕНО: Тепер також відстежує закриті позиції
-        """
+        """Оновлює стан позицій на основі даних з біржі"""
         # Створюємо словник відкритих позицій на біржі
         open_symbols = {}
         for pos in exchange_positions:
@@ -486,7 +611,6 @@ class PositionManager:
             else:
                 # Позиція закрита на біржі
                 if managed.state == PositionState.POSITION_DETECTED:
-                    # ✨ НОВА ЛОГІКА: Позиція була відкрита і тепер закрита
                     logging.info(f"🔔 Позиція закрита: {symbol}")
                     
                     # Переміщуємо в закриті позиції для повідомлення
@@ -503,13 +627,14 @@ def calculate_risk_params(balance: float, price: float, direction: str, contract
     """
     Розраховує параметри ризику для позиції.
     
-    ✨ ОНОВЛЕНО: Додано параметр contract_size для правильного розрахунку кількості контрактів
+    ✨ ОНОВЛЕНО: Правильна конвертація з монет в контракти
     
     Args:
         balance: Доступний баланс в USDT
         price: Поточна ціна монети
         direction: "LONG" або "SHORT"
-        contract_size: Скільки монет в одному контракті (наприклад, 0.1 для HYPE)
+        contract_size: Скільки монет в одному контракті
+                      Наприклад: 1 для ADA, 0.1 для HYPE
     
     Returns:
         dict: {
@@ -517,6 +642,18 @@ def calculate_risk_params(balance: float, price: float, direction: str, contract
             'tp_percent': float,
             'sl_percent': float
         }
+    
+    Приклад розрахунку:
+        - Balance: 100 USDT
+        - Risk: 3%
+        - Leverage: 20x
+        - Price: 0.5 USDT
+        - ContractSize: 0.1 (HYPE)
+        
+        Крок 1: risk_amount = 100 * 0.03 = 3 USDT
+        Крок 2: position_value = 3 * 20 = 60 USDT
+        Крок 3: qty_coins = 60 / 0.5 = 120 монет HYPE
+        Крок 4: qty_contracts = 120 / 0.1 = 1200 контрактів
     """
     try:
         risk_percent = float(os.getenv("RISK_PERCENT", 3))
@@ -533,19 +670,28 @@ def calculate_risk_params(balance: float, price: float, direction: str, contract
         # Кількість МОНЕТ які ми хочемо купити
         qty_coins = position_value / price
         
-        # ✨ КЛЮЧОВА ЗМІНА: Конвертуємо монети в контракти
-        # Якщо 1 контракт = 0.1 монети (contract_size = 0.1)
-        # То для покупки 1 монети потрібно 1 / 0.1 = 10 контрактів
+        # ✨ КЛЮЧОВА ФОРМУЛА: Конвертуємо монети в контракти
+        # Формула: contracts = coins / contractSize
+        # 
+        # Якщо contractSize = 1 (як у ADA):
+        #   200 монет / 1 = 200 контрактів
+        # 
+        # Якщо contractSize = 0.1 (як у HYPE):
+        #   2 монети / 0.1 = 20 контрактів
         qty_contracts = qty_coins / contract_size
         
-        # Округлюємо до цілого числа контрактів
+        # Округлюємо вгору до цілого числа контрактів
         qty_contracts = max(1, int(qty_contracts))
         
         logging.info(
-            f"💰 Розрахунок: Balance={balance:.2f}, Risk={risk_percent}%, "
-            f"Position=${position_value:.2f}, Price=${price:.4f}, "
-            f"ContractSize={contract_size}, "
-            f"Монет={qty_coins:.2f} → Контрактів={qty_contracts}"
+            f"💰 Розрахунок ризику:\n"
+            f"  Balance: {balance:.2f} USDT\n"
+            f"  Risk: {risk_percent}% = {risk_amount:.2f} USDT\n"
+            f"  Leverage: {leverage}x\n"
+            f"  Position Value: {position_value:.2f} USDT\n"
+            f"  Price: ${price:.6f}\n"
+            f"  ContractSize: {contract_size}\n"
+            f"  📊 Монет: {qty_coins:.2f} → Контрактів: {qty_contracts}"
         )
         
         return {
@@ -553,7 +699,8 @@ def calculate_risk_params(balance: float, price: float, direction: str, contract
             'tp_percent': tp_percent,
             'sl_percent': sl_percent
         }
-    except:
+    except Exception as e:
+        logging.error(f"❌ Помилка calculate_risk_params: {e}")
         return {
             'qty': 1,
             'tp_percent': 10.0,
@@ -567,7 +714,7 @@ def calculate_pnl(entry_price: float, close_price: float, size: float, direction
     
     Args:
         entry_price: Ціна входу
-        close_price: Ціна закриття (можна взяти поточну ціну як approximation)
+        close_price: Ціна закриття
         size: Розмір позиції в контрактах
         direction: "LONG" або "SHORT"
     
@@ -578,14 +725,10 @@ def calculate_pnl(entry_price: float, close_price: float, size: float, direction
         return 0.0, 0.0
     
     if direction == "LONG":
-        # Для LONG: прибуток якщо ціна виросла
         price_change_percent = ((close_price - entry_price) / entry_price) * 100
     else:
-        # Для SHORT: прибуток якщо ціна впала
         price_change_percent = ((entry_price - close_price) / entry_price) * 100
     
-    # PnL в USDT (approximate, без врахування комісій та точного розміру)
-    # Точний розрахунок вимагає знання точного розміру в USDT
     position_value = size * entry_price
     pnl_usdt = position_value * (price_change_percent / 100)
     
@@ -600,86 +743,52 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
     
     while True:
         try:
-            if len(manager.positions) == 0 and len(manager.closed_positions) == 0:
+            if not manager.positions and not manager.closed_positions:
                 await asyncio.sleep(check_interval)
                 continue
             
+            # Отримуємо позиції з біржі
             exchange_positions = web_client.get_open_positions()
             manager.update_from_exchange(exchange_positions)
             
-            # Повідомлення про підтверджені позиції (як і раніше)
-            for symbol, managed in list(manager.positions.items()):
-                if managed.state == PositionState.POSITION_DETECTED and managed.entry_price > 0:
-                    target_id = os.getenv("SIGNAL_CHANNEL_ID")
-                    
-                    msg = (
-                        f"✅ <b>ПОЗИЦІЯ ПІДТВЕРДЖЕНА</b>\n\n"
-                        f"<b>Символ:</b> {symbol}\n"
-                        f"<b>Бік:</b> {managed.signal_direction}\n"
-                        f"<b>Вхід:</b> ${managed.entry_price}\n"
-                        f"<b>Розмір:</b> {managed.current_size}\n\n"
-                        f"🎯 <b>TP:</b> ${managed.target_tp}\n"
-                        f"🛑 <b>SL:</b> ${managed.target_sl}\n\n"
-                        f"ℹ️ TP/SL встановлені при відкритті"
-                    )
-                    
-                    await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
-                    
-                    # НЕ видаляємо з менеджера - продовжуємо відстежувати для повідомлення про закриття
-                    # Просто змінюємо стан щоб не слати повторні повідомлення
-                    managed.state = PositionState.POSITION_DETECTED
+            # Обробляємо закриті позиції
+            target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
             
-            # ✨ НОВА ЛОГІКА: Повідомлення про закриті позиції
-            for symbol, managed in list(manager.closed_positions.items()):
-                target_id = os.getenv("SIGNAL_CHANNEL_ID")
-                
-                # Отримуємо поточну ціну як approximation ціни закриття
+            for symbol in list(manager.closed_positions.keys()):
                 try:
+                    managed = manager.closed_positions[symbol]
+                    
+                    # Отримуємо поточну ціну як approximation ціни закриття
                     url_price = "https://contract.mexc.com/api/v1/contract/ticker"
                     resp = web_client.session.get(url_price, params={"symbol": symbol}, timeout=10)
-                    close_price = managed.entry_price  # Fallback
                     
+                    close_price = managed.entry_price
                     if resp.status_code == 200:
                         ticker_data = resp.json()
                         if ticker_data.get("success") and ticker_data.get("data"):
                             close_price = float(ticker_data["data"][0].get("lastPrice", managed.entry_price))
                     
+                    managed.close_price = close_price
+                    
                     # Розраховуємо PnL
                     pnl_usdt, pnl_percent = calculate_pnl(
-                        entry_price=managed.entry_price,
-                        close_price=close_price,
-                        size=managed.current_size,
-                        direction=managed.signal_direction
+                        managed.entry_price,
+                        close_price,
+                        managed.current_size,
+                        managed.signal_direction
                     )
                     
-                    # Визначаємо результат (TP, SL, або Manual)
-                    result_type = "ЗАКРИТО"
-                    result_icon = "⚪"
-                    
-                    # Перевіряємо чи близько до TP або SL
-                    if managed.signal_direction == "LONG":
-                        if close_price >= managed.target_tp * 0.99:  # Близько до TP
-                            result_type = "TAKE PROFIT"
-                            result_icon = "✅"
-                        elif close_price <= managed.target_sl * 1.01:  # Близько до SL
-                            result_type = "STOP LOSS"
-                            result_icon = "🛑"
-                    else:  # SHORT
-                        if close_price <= managed.target_tp * 1.01:
-                            result_type = "TAKE PROFIT"
-                            result_icon = "✅"
-                        elif close_price >= managed.target_sl * 0.99:
-                            result_type = "STOP LOSS"
-                            result_icon = "🛑"
+                    managed.pnl_usdt = pnl_usdt
+                    managed.pnl_percent = pnl_percent
                     
                     # Формуємо повідомлення
                     pnl_sign = "+" if pnl_usdt >= 0 else ""
                     msg = (
-                        f"{result_icon} <b>{result_type}</b>\n\n"
+                        f"🔔 <b>ПОЗИЦІЮ ЗАКРИТО</b>\n\n"
                         f"<b>Символ:</b> {symbol}\n"
-                        f"<b>Бік:</b> {managed.signal_direction}\n"
+                        f"<b>Напрямок:</b> {managed.signal_direction}\n"
                         f"<b>Вхід:</b> ${managed.entry_price:.4f}\n"
-                        f"<b>Вихід:</b> ${close_price:.4f}\n"
+                        f"<b>Закриття:</b> ${close_price:.4f}\n"
                         f"<b>Розмір:</b> {managed.current_size}\n\n"
                         f"💰 <b>PnL:</b> {pnl_sign}{pnl_usdt:.2f} USDT ({pnl_sign}{pnl_percent:.2f}%)\n"
                     )
@@ -690,10 +799,10 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
                 except Exception as e:
                     logging.error(f"❌ Помилка при обробці закритої позиції {symbol}: {e}")
                 
-                # Видаляємо з закритих після відправки повідомлення
+                # Видаляємо з закритих
                 del manager.closed_positions[symbol]
                 
-                # Також видаляємо з активних позицій
+                # Видаляємо з активних
                 if symbol in manager.positions:
                     del manager.positions[symbol]
             
@@ -708,7 +817,7 @@ async def position_monitoring_loop(web_client: MexcWebClient, manager: PositionM
 # ==========================================
 position_manager = None
 mexc_web = None
-last_pause_notification = 0  # Timestamp останнього повідомлення про паузу
+last_pause_notification = 0
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global mexc_web, position_manager
@@ -722,8 +831,15 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     try:
         data = json.loads(json_match.group(1))
-        symbol_raw = str(data.get('symbol', '')).upper().replace('_', '').replace('USDT', '')
-        symbol_api = f"{symbol_raw}_USDT"
+        
+        # ✨ ОНОВЛЕНО: Правильна нормалізація символу
+        symbol_raw = str(data.get('symbol', '')).upper()
+        
+        # Видаляємо підкреслення якщо є, потім додаємо назад правильно
+        symbol_clean = symbol_raw.replace('_', '').replace('USDT', '')
+        symbol_normalized = normalize_symbol_to_mexc_contract(f"{symbol_clean}USDT")
+        
+        logging.info(f"📊 Символ: raw={symbol_raw} → normalized={symbol_normalized}")
         
         signal_type = str(data.get('signalType', '')).upper()
         price = float(data['stats']['lastPrice'])
@@ -731,52 +847,47 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         my_direction = "LONG" if signal_type == "LONG_FLUSH" else "SHORT" if signal_type == "SHORT_SQUEEZE" else None
         if not my_direction: return
 
-        if not position_manager.can_accept_signal(symbol_api): return
+        if not position_manager.can_accept_signal(symbol_normalized): return
 
         balance = mexc_web.get_balance()
         if balance < 5:
             await context.bot.send_message(chat_id=target_id, text=f"❌ Низький баланс: {balance} USDT")
             return
 
-        # ⏰ ПЕРЕВІРКА РОБОЧИХ ГОДИН
+        # ⏰ Перевірка робочих годин
         global last_pause_notification
         is_allowed, reason = is_trading_hours()
         
         if not is_allowed:
             logging.info(f"⏸️ Торгівля призупинена: {reason}")
             
-            # Відправляємо повідомлення максимум раз на годину
             current_time = time.time()
-            if current_time - last_pause_notification > 3600:  # 1 година
+            if current_time - last_pause_notification > 3600:
                 last_pause_notification = current_time
                 
                 pause_msg = (
                     f"⏸️ <b>ТОРГІВЛЯ ПРИЗУПИНЕНА</b>\n\n"
-                    f"📊 Сигнал: {symbol_api} {my_direction}\n"
+                    f"📊 Сигнал: {symbol_normalized} {my_direction}\n"
                     f"⏰ {reason}\n\n"
                     f"ℹ️ Бот продовжить торгівлю в робочі години"
                 )
                 await context.bot.send_message(chat_id=target_id, text=pause_msg, parse_mode="HTML")
             
-            return  # Виходимо без відкриття позиції
+            return
 
-        # ✨ ОНОВЛЕНО: Отримуємо інформацію про контракт з кешу
-        contract_info = mexc_web.contract_size_cache.get(symbol_api)
-        
-        if not contract_info:
-            # Якщо чомусь немає в кеші, отримуємо зараз
-            contract_info = mexc_web.get_contract_info(symbol_api)
-            mexc_web.contract_size_cache[symbol_api] = contract_info
-        
+        # ✨ ОНОВЛЕНО: Отримуємо contract info з кешу
+        contract_info = mexc_web.get_contract_info(symbol_normalized)
         contract_size = contract_info['contractSize']
         tick = contract_info['tickSize']
         
-        logging.info(f"📊 {symbol_api}: ContractSize={contract_size}, TickSize={tick}")
+        logging.info(
+            f"📊 {symbol_normalized}: ContractSize={contract_size}, TickSize={tick}"
+        )
 
-        # ✨ ОНОВЛЕНО: Передаємо contract_size в розрахунок ризику
+        # ✨ Розраховуємо ризик з правильним contract_size
         risk = calculate_risk_params(balance, price, my_direction, contract_size)
         
-        # Розраховуємо TP/SL від поточної ціни (як approximation)
+        # Розраховуємо TP/SL
         tp_price, sl_price = mexc_web.calculate_tp_sl(
             entry_price=price,
             direction=my_direction,
@@ -785,14 +896,17 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             tick=tick
         )
         
-        position_manager.add_signal(symbol_api, my_direction, sl_price, tp_price)
+        position_manager.add_signal(symbol_normalized, my_direction, sl_price, tp_price)
         
-        logging.info(f"🚀 Відкриваю {my_direction} {symbol_api}, Контрактів: {risk['qty']}")
+        logging.info(
+            f"🚀 Відкриваю {my_direction} {symbol_normalized}, "
+            f"Контрактів: {risk['qty']}"
+        )
 
         res = mexc_web.open_position_with_sl_tp(
-            symbol=symbol_api,
+            symbol=symbol_normalized,
             direction=my_direction,
-            quantity=risk['qty'],  # Вже в контрактах!
+            quantity=risk['qty'],
             leverage=int(os.getenv("LEVERAGE", 20)),
             tp_price=tp_price,
             sl_price=sl_price
@@ -801,7 +915,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         if res.get("success") or res.get("dry_run"):
             msg = (
                 f"✅ <b>ОРДЕР ВІДПРАВЛЕНО</b>\n\n"
-                f"{symbol_api} {my_direction}\n"
+                f"{symbol_normalized} {my_direction}\n"
                 f"Контрактів: {risk['qty']}\n"
                 f"🎯 TP: ${tp_price}\n"
                 f"🛑 SL: ${sl_price}\n\n"
@@ -809,8 +923,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             await context.bot.send_message(chat_id=target_id, text=msg, parse_mode="HTML")
         else:
-            if symbol_api in position_manager.positions:
-                del position_manager.positions[symbol_api]
+            if symbol_normalized in position_manager.positions:
+                del position_manager.positions[symbol_normalized]
             
             error_msg = res.get('msg') or res.get('error') or 'Невідома помилка'
             safe_error = str(error_msg).replace('<', '').replace('>', '')
@@ -827,7 +941,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def post_init(application):
     target_id = os.getenv("SIGNAL_CHANNEL_ID", "").strip()
     if target_id:
-        # Перевіряємо статус trading hours
         is_allowed, reason = is_trading_hours()
         hours_enabled = os.getenv("TRADING_HOURS_ENABLED", "false").lower() == "true"
         
@@ -836,12 +949,13 @@ async def post_init(application):
         hours_text = f"<i>{reason}</i>" if hours_enabled else ""
         
         startup_msg = (
-            f"🚀 <b>MEXC Bot v2.1 Запущено</b>\n"
+            f"🚀 <b>MEXC Bot v2.2 Запущено</b>\n"
             f"{mode_text}"
             f"{hours_text}\n"
             f"{status_icon} <i>{'Торгівля активна' if is_allowed else 'Торгівля призупинена'}</i>\n\n"
-            f"<i>✨ ContractSize підтримка\n"
-            f"✨ Повідомлення про закриття</i>"
+            f"<i>✨ Реальна підтримка ContractSize через API\n"
+            f"✨ Нормалізація символів (ADAUSDT → ADA_USDT)\n"
+            f"✨ Завантажено {len(mexc_web.contract_size_cache)} контрактів</i>"
         )
         
         await application.bot.send_message(chat_id=target_id, text=startup_msg, parse_mode='HTML')
@@ -856,12 +970,9 @@ def main():
     mexc_web = MexcWebClient(web_token)
     position_manager = PositionManager()
     
-    # ✨ НОВИЙ КОД: Завантажуємо інформацію про контракти для дозволених монет
-    allowed_symbols_str = os.getenv("ALLOWED_SYMBOLS", "BTC_USDT,ETH_USDT")
-    allowed_symbols = [s.strip() for s in allowed_symbols_str.split(",")]
-    
-    logging.info(f"📋 Дозволені монети: {allowed_symbols}")
-    mexc_web.load_contract_sizes(allowed_symbols)
+    # ✨ КЛЮЧОВА ЗМІНА: Завантажуємо ВСІ контракти одним запитом
+    logging.info("📥 Завантажую інформацію про контракти...")
+    mexc_web.load_contract_sizes()
     
     async def init_and_start_monitoring(app):
         await post_init(app)
